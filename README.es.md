@@ -63,12 +63,14 @@ frío (las ventanas de texto se vuelven a sortear).
 | `germen train` | entrena desde cero (`--data ARCHIVO` o `--demo`), o continúa con `--resume` |
 | `germen generate` | genera texto con un modelo entrenado, con una caché de claves y valores (`--temperature`, `--top-k`, `--prompt`) |
 
-Opciones de entrenamiento que conviene conocer: `--tokenizer byte|bpe` y `--vocab N` (el tamaño
-del BPE); `--batch` y `--accum` (acumulación de gradientes: el lote efectivo es su producto, la
-memoria es la de `--batch` solo); `--grad-clip` (norma global del gradiente, 1 por defecto);
-`--lr`, `--warmup`, `--weight-decay`. `germen train --help` las lista todas. Añada `--threads N`
-a cualquier comando para limitar el número de hilos de trabajo (por defecto, todos los
-procesadores lógicos). Los mensajes de la línea de comandos están por ahora solo en rumano.
+Opciones de entrenamiento que conviene conocer: `--tokenizer byte|bpe` y `--vocab N` (el tamaño del
+BPE); `--batch` y `--accum` (acumulación de gradientes: el lote efectivo es su producto, la memoria
+es la de `--batch` solo); `--replicas N` (copias del modelo que se reparten cada micro-lote entre
+los hilos; 0 = automático, 1 = desactivado; elija un `--batch` al menos igual al número de hilos);
+`--grad-clip` (norma global del gradiente, 1 por defecto); `--lr`, `--warmup`, `--weight-decay`.
+`germen train --help` las lista todas. Añada `--threads N` a cualquier comando para limitar el
+número de hilos de trabajo (por defecto, todos los procesadores lógicos). Los mensajes de la línea
+de comandos están por ahora solo en rumano.
 
 ## Tamaños de modelo
 
@@ -91,24 +93,27 @@ El coste del entrenamiento es de unas **6 × parámetros × tokens** operaciones
 (con bytes, 1 MB de texto = 1 millón de tokens). Divida por lo que su CPU entrega de verdad y
 tendrá el tiempo. `germen bench` mide exactamente eso en su máquina.
 
-Medición de referencia — una pequeña máquina virtual Linux con **2 núcleos** (AVX-512), lote
-16 × 256, vocabulario de bytes (una sola ejecución en una máquina virtual ruidosa, así que ± 5 %):
+Medición de referencia — una pequeña máquina virtual Linux con **2 núcleos** (AVX-512), lote 16 ×
+256, vocabulario de bytes, ajustes por defecto (mediana de cinco ejecuciones alternadas en una
+máquina virtual ruidosa, así que ± 10 %):
 
 | nombre | tokens/s | GFLOPS efectivos | 100 M tokens | 1000 M tokens |
 |---|---:|---:|---:|---:|
-| `nano` | 8.261 | 54 | 3,4 h | 1,4 días |
-| `micro` | 3.180 | 63 | 8,7 h | 3,6 días |
-| `mini` | 1.260 | 90 | 22,0 h | 9,2 días |
-| `small` | 545 | 90 | 2,1 días | 21 días |
+| `nano` | 8.366 | 54 | 3,3 h | 1,4 días |
+| `micro` | 3.981 | 79 | 7,0 h | 2,9 días |
+| `mini` | 1.464 | 104 | 19,0 h | 7,9 días |
+| `small` | 647 | 106 | 1,8 días | 18 días |
 
-Pasar de 1 a 2 hilos hizo `mini` 1,51× más rápido aquí (825 → 1.247 tokens/s), así que no espere
-que 20 núcleos den 20×. Los productos de matrices escalan bien (≈ 1,8× con dos hilos); la atención
-menos (≈ 1,2×), y RMSNorm, los embeddings rotatorios y la actualización de AdamW casi nada, por lo
-que en una máquina con muchos núcleos se convierten en el cuello de botella (ley de Amdahl). Para
-eso existe `germen bench --scaling`: imprime toda la curva y el número de hilos a partir del cual
-ya no se gana nada. **Ejecute `germen bench --scaling --json bench.json` en su máquina** — es la
-única forma de saberlo. Una regla empírica para el entrenamiento óptimo en cómputo es de unos 20
-tokens por parámetro; los modelos pequeños suelen entrenarse con mucho más.
+Pasar de 1 a 2 hilos hizo `mini` 2,04× más rápido aquí (733 → 1.494 tokens/s; 1,41× con `--replicas
+1`), así que no espere que 20 núcleos den 20×. En un solo grafo los productos de matrices escalan
+bien (≈ 1,8× con dos hilos), la atención menos (≈ 1,2×), y RMSNorm, los embeddings rotatorios y la
+actualización de AdamW casi nada; las réplicas de la versión 0.3 ejecutan esas partes una al lado de
+otra, pero necesitan al menos tantas ventanas por lote como hilos. Hasta dónde llega eso con muchos
+núcleos no se ha medido: para eso existe `germen bench --scaling`, que imprime toda la curva y el
+número de hilos a partir del cual ya no se gana nada. **Ejecute `germen bench --scaling --json
+bench.json` en su máquina** — es la única forma de saberlo. Una regla empírica para el entrenamiento
+óptimo en cómputo es de unos 20 tokens por parámetro; los modelos pequeños suelen entrenarse con
+mucho más.
 
 La generación usa una caché de claves y valores: 400 tokens con `mini` tardan aproximadamente 1
 segundo en lugar de 15 en los mismos dos núcleos.
@@ -140,31 +145,40 @@ crates/germen-cli    la línea de comandos `germen` (clap)
   (`Event`) para que una interfaz gráfica pueda reutilizar el mismo bucle.
 * **Hilos** — todo el comando se ejecuta como un trabajador de su propio grupo de hilos, que lanza
   los bucles paralelos sin traspasos entre hilos (+ 7 % para `mini`, hasta + 25 % para `nano`, con
-  dos núcleos). Repartir micro-lotes entre varios hilos que manejan Burn a la vez se probó y se
-  descartó; véase [docs/PLAN.md](docs/PLAN.md).
+  dos núcleos). Además, cada micro-lote se reparte en **réplicas de datos en paralelo**: copias del
+  modelo, cada una con su propio grafo de diferenciación automática, ejecutan la pasada hacia
+  delante y hacia atrás en hilos distintos, y sus gradientes se suman en un orden fijo, de modo que
+  una ejecución es reproducible para un número dado de hilos y de réplicas (de + 23 % a + 44 % con
+  dos núcleos según el modelo, con un pico de memoria más bajo; `--replicas 1` da el paso
+  ordinario). Repartir micro-lotes entre hilos que compartían todos un mismo grafo se probó en la
+  0.2 y se descartó; véase [docs/PLAN.md](docs/PLAN.md).
 * **Punto de control** — una carpeta con `config.json`, `weights.bpk` (el formato burnpack de
   Burn, f32), `optimizer.bpk` (los momentos de AdamW), `tokenizer.json` y `meta.json`. Los puntos
   de control escritos por la versión 0.1 se siguen cargando.
-* **Pruebas** — 70 pruebas unitarias, entre ellas: la atención es causal, la atención por bloques
-  iguala la de Burn (valores y gradientes), la generación con caché iguala el paso completo, los
-  micro-lotes acumulados equivalen a un lote grande, un paso de optimización tras recargar el
-  estado de AdamW iguala el de un entrenamiento ininterrumpido, toda secuencia de bytes sobrevive
-  al viaje de ida y vuelta por el BPE.
+* **Pruebas** — 117 pruebas (unitarias de la biblioteca y de la línea de comandos, más ejecuciones
+  completas del binario real), entre ellas: la atención es causal, la atención por bloques iguala la
+  de Burn (valores y gradientes), la generación con caché iguala el paso completo, los micro-lotes
+  acumulados equivalen a un lote grande, las réplicas dan los gradientes de un solo grafo grande y
+  una ejecución es reproducible bit a bit, un paso de optimización tras recargar el estado de AdamW
+  iguala el de un entrenamiento ininterrumpido, un punto de control nunca queda a medio escribir y
+  los pesos no finitos nunca se guardan, los archivos hostiles de tokenizador y de configuración se
+  rechazan, toda secuencia de bytes sobrevive al viaje de ida y vuelta por el BPE. La auditoría
+  adversarial está en [docs/AUDIT.md](docs/AUDIT.md).
 
-## Límites (versión 0.2)
+## Límites (versión 0.3)
 
 * Todo el corpus se lee en memoria (como identificadores de 16 bits); están previstos corpus
   mapeados en memoria, mayores que la RAM.
-* Algunas operaciones del paso (RMSNorm, embeddings rotatorios, actualización de AdamW) todavía no
-  aprovechan bien los núcleos adicionales; paralelizarlas es la principal tarea abierta de
-  rendimiento.
+* En un solo grafo, algunas operaciones del paso (RMSNorm, embeddings rotatorios, actualización de
+  AdamW) no aprovechan bien los núcleos adicionales; las réplicas lo ocultan cuando `--batch` es al
+  menos igual al número de hilos, pero hasta dónde llega eso con muchos núcleos aún no se ha medido.
 * Sin precisión mixta y sin backend de GPU.
 * El corpus `demo` es sintético y diminuto: demuestra que la cadena aprende, nada más.
 * Aún sin medir en Windows, macOS ni en una máquina con muchos núcleos — arriba se explica cómo
   ayudar.
 
-Véanse [CHANGELOG.md](CHANGELOG.md) y [docs/PLAN.md](docs/PLAN.md). Las contribuciones son
-bienvenidas ([CONTRIBUTING.md](CONTRIBUTING.md)).
+Véanse [CHANGELOG.md](CHANGELOG.md), [docs/PLAN.md](docs/PLAN.md) y [docs/AUDIT.md](docs/AUDIT.md).
+Las contribuciones son bienvenidas ([CONTRIBUTING.md](CONTRIBUTING.md)).
 
 ## Licencia
 

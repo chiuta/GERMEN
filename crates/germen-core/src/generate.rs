@@ -1,8 +1,8 @@
 //! Text generation: sampling the next token from the model, one token at a time.
 //!
-//! Every new token needs a full forward pass over the context window (there is no key/value
-//! cache yet), so generation costs roughly `window × params × 2` FLOPs per token. A 128-token
-//! window keeps this fast enough for the small models GERMEN targets.
+//! The model keeps a key/value cache, so every new token costs one token's worth of computation
+//! (not a pass over the whole window); when the cache is full, generation goes on from the most
+//! recent half of the context. Sampling is plain temperature and top-k over the logits.
 
 use crate::data::Rng;
 use crate::model::{Gpt, KvCache};
@@ -97,6 +97,9 @@ fn next_logits(model: &Gpt, tokens: &[TokenId], cache: &mut KvCache, device: &De
         .expect("logits are f32")
 }
 
+/// Most tokens `generate` reserves room for before producing any.
+const MAX_UPFRONT_TOKENS: usize = 1 << 16;
+
 /// Continues `prompt` (text bytes) by `opts.max_new` tokens. `on_token` is called with each new
 /// token as soon as it is chosen (use it to stream the text, see
 /// [`crate::tokenizer::Utf8Stream::push_token`]). An empty prompt starts from a newline.
@@ -118,7 +121,9 @@ pub fn generate(
     let mut context: Vec<TokenId> =
         tokenizer.encode(if prompt.is_empty() { b"\n" } else { prompt });
     let window = opts.window.clamp(2, model.block_size());
-    let mut out = Vec::with_capacity(opts.max_new);
+    // Never reserve more than a modest amount up front: `--max-new` is a number typed by a person
+    // (a mistyped one used to abort the process with "capacity overflow" before the first token).
+    let mut out = Vec::with_capacity(opts.max_new.min(MAX_UPFRONT_TOKENS));
     if opts.max_new == 0 {
         return out;
     }
@@ -187,9 +192,45 @@ mod tests {
     }
 
     #[test]
+    fn an_absurd_max_new_does_not_abort_before_the_first_token() {
+        // `Vec::with_capacity(usize::MAX)` panics ("capacity overflow"), and anything merely huge
+        // aborts the process. The run is cut short from inside the callback, as Ctrl-C would.
+        let device = Device::flex();
+        let model = Preset::Nano.config(16).init_seeded(&device, 1);
+        for max_new in [usize::MAX, usize::MAX / 8, 1usize << 40] {
+            let opts = SampleOptions {
+                max_new,
+                temperature: 1.0,
+                top_k: 0,
+                window: 8,
+            };
+            let mut produced = 0;
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                generate(
+                    &model,
+                    &Tokenizer::Byte,
+                    b"x",
+                    &opts,
+                    &mut Rng::new(1),
+                    &device,
+                    |_| {
+                        produced += 1;
+                        assert!(produced < 5, "enough tokens seen");
+                    },
+                )
+            }));
+            assert!(
+                outcome.is_err(),
+                "the callback must have been reached and stopped the run"
+            );
+            assert_eq!(produced, 5, "max_new = {max_new}");
+        }
+    }
+
+    #[test]
     fn generate_returns_requested_length_and_streams_tokens() {
         let device = Device::flex();
-        let model = Preset::Nano.config(16).init(&device);
+        let model = Preset::Nano.config(16).init_seeded(&device, 1);
         let opts = SampleOptions {
             max_new: 12,
             temperature: 1.0,
@@ -214,7 +255,7 @@ mod tests {
     #[test]
     fn generation_far_beyond_the_window_slides_without_trouble() {
         let device = Device::flex();
-        let model = Preset::Nano.config(32).init(&device);
+        let model = Preset::Nano.config(32).init_seeded(&device, 1);
         let opts = SampleOptions {
             max_new: 150, // many times the window of 16: the cache is rebuilt again and again
             temperature: 0.9,
@@ -328,7 +369,7 @@ mod tests {
     #[test]
     fn generate_is_deterministic_for_a_fixed_seed() {
         let device = Device::flex();
-        let model = Preset::Nano.config(16).init(&device);
+        let model = Preset::Nano.config(16).init_seeded(&device, 1);
         let opts = SampleOptions {
             max_new: 8,
             ..SampleOptions::default()

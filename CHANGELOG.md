@@ -4,6 +4,89 @@ All notable changes to GERMEN are listed here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [0.3.0] — 2026-11-17
+
+An adversarial audit of 0.2 and the optimizations it justified. Every finding, how it was
+reproduced on 0.2.0, and what was tried and rejected by measurement is in
+[docs/AUDIT.md](docs/AUDIT.md). Training is 23–44 % faster on two cores (median of five
+interleaved runs against the ordinary step, batch 16 × 256): `nano` 6,807 → 8,366 tokens/s,
+`micro` 2,769 → 3,981, `mini` 1,090 → 1,464, `small` 475 → 647. (The virtual machine was 9–14 %
+slower in that session than when the 0.2 table was measured — the 0.2.0 binary itself measured
+that much lower — so compare the ratios, not the 0.2 figures.)
+
+### Added
+- **Data-parallel replicas** (`--replicas N` for `train` and `bench`; 0, the default, is automatic:
+  one per thread, never more than the windows of a batch, fewer if the extra gradient copies would
+  not fit in memory; 1 is the ordinary step). The windows of a micro-batch are split among copies
+  of the model, each with an autodiff graph of its own (`Module::fork`), run forward and backward on
+  different threads; the gradients are added in a fixed pairwise order, and the initial weights are
+  drawn in a fixed order, so a run is reproducible for a given number of threads and replicas. The
+  attempt of 0.2, which shared one graph between threads, deadlocked and was rejected; a test now
+  runs pools of one to five threads with two to eight replicas under a watchdog.
+- **Checkpoints are written as a set**: every file is staged under a temporary name, flushed to
+  disk, then renamed into place with `meta.json` last, so a save that fails while writing (disk
+  full, I/O error, a kill) leaves the previous checkpoint exactly as it was. Non-finite weights are
+  never written and never loaded. A `.germen.lock` file keeps a second run out of a directory that
+  one is using.
+- Available-memory probes for **Windows** (`GlobalMemoryStatusEx`) and **macOS** (`vm_stat`), so the
+  "will it fit" check works there too (it only worked on Linux before).
+- `docs/AUDIT.md`; `scripts/audit_repro.py` (black-box reproductions of the findings, runnable
+  against any `germen` binary) and `examples/audit_lib.rs` (the library-level ones).
+- Seven end-to-end tests of the real binary (`crates/germen-cli/tests/cli.rs`): 117 tests in all.
+- CI: a job that builds with the minimum supported Rust (1.95), concurrency control, smoke runs
+  with `--replicas 1` and `--replicas 3`, and a weekly RustSec advisory scan (`audit.yml`).
+- API: `Batch::split`, `GptConfig::init_seeded`, `Gpt::init_parameters`, `checkpoint::save_all`,
+  `checkpoint::ensure_finite`, `GptConfig::estimate_train_bytes_replicated`, `train::plan_replicas`,
+  `sys::memory_limit_bytes`.
+
+### Changed
+- **The same `--seed` gives a different run than in 0.2**: the random generator is now seeded
+  through SplitMix64 (finding A-14 in [docs/AUDIT.md](docs/AUDIT.md)) and the initial weights are
+  drawn in a fixed order. Checkpoints written by 0.2 and 0.1 load and resume unchanged.
+- `--resume` with a `--steps` smaller than the step already reached is an error that explains that
+  `--steps` is the total (0.2.0 exited 0 and rewrote `meta.json`); exactly as many is a success that
+  says there is nothing to do, and nothing is rewritten, so a "resume until done" loop ends.
+- `--threads` above 1,024 is refused up front with a clear message (0.2.0 left it to the operating
+  system, which refused too).
+- Ctrl-C is honoured between micro-batches instead of between steps; the partial sum is dropped.
+- The configuration of a model, the training options and the command-line numbers are validated
+  with ceilings and finiteness checks (`GptConfig::validate`, `TrainOptions::validate`).
+- Library API (the 0.x series makes no promise, but for the record): `TrainOptions`, `Event::Start`,
+  `BenchParams` and `BenchResult` have a new `replicas` field and `bench_model` a new parameter.
+- `#![deny(unsafe_code)]` in both crates; the single `unsafe` call (the Windows memory probe) is
+  allowed in its own module.
+
+### Fixed
+Each item has an ID in [docs/AUDIT.md](docs/AUDIT.md), with the evidence and the test.
+- A `tokenizer.json` of a few hundred bytes could make the loader allocate until the process was
+  aborted (A-01); a `config.json` with absurd dimensions aborted on allocation (A-02); a
+  `weights.bpk` with NaN weights was loaded without a word (A-03).
+- A save that failed half-way left new weights next to an old optimizer state (A-04); a diverged
+  run wrote NaN weights over the last good checkpoint (A-05); two `--resume` runs could share one
+  output directory (A-06).
+- `--grad-clip nan` silently trained without clipping (A-07); `--resume` with too few steps
+  exited 0 and rewrote `meta.json` (A-08); `meta.json` stored the number of tokens, not bytes, as
+  `corpus_bytes` with BPE (A-09).
+- `--tokenizer bpe --val-fraction 2` panicked (A-10); `--val-fraction 0` reported "validation" loss
+  measured on the training text without saying so (A-11); `--demo-mb 1e9` aborted (A-12);
+  `generate --max-new 5000000000` aborted before the first token (A-13); the seeds 2k and 2k+1
+  gave the same random stream (A-14); Ctrl-C with `--accum 60` took 29.8 s to act (A-16).
+- On Windows and macOS the "will it fit in memory" check had no memory figure to compare with
+  (A-17), and on Windows a save could fail when an antivirus scanner held the file just written
+  (A-18). Both were found by reading the code; this machine cannot run them.
+- Burn keeps one random generator for the whole process, and two threads that seeded and
+  initialised a model at the same moment took shares of each other's stream, so the weights a seed
+  promises depended on timing (A-24). Seeding and drawing are now one locked step
+  (`GptConfig::init_seeded`). The 0.3 test suite itself was affected: a reproducibility test failed
+  in 2 of 13 parallel runs, which a verification in a clean directory revealed (40 runs in a row
+  pass now).
+
+### Measured and rejected
+Allocator tuning and `mimalloc` (slower), lowering the thresholds at which Flex splits element-wise
+work across threads, a bigger batch, and a parallel or fused AdamW update (the update is about
+1.8 % of a step) gave nothing; removing RMSNorm, rotary embeddings, the activation, the softmax or
+the mask altogether saves less than 2–4 % of a step each. Details in [docs/AUDIT.md](docs/AUDIT.md).
+
 ## [0.2.0] — 2026-11-17
 
 Closes the limitations of 0.1 that mattered most (tokenizer, resume, clipping, generation speed,

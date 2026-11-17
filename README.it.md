@@ -63,13 +63,14 @@ freddo (le finestre di testo vengono estratte di nuovo a caso).
 | `germen train` | addestra da zero (`--data FILE` oppure `--demo`), o continua con `--resume` |
 | `germen generate` | genera testo da un modello addestrato, con una cache chiave/valore (`--temperature`, `--top-k`, `--prompt`) |
 
-Opzioni di addestramento da conoscere: `--tokenizer byte|bpe` e `--vocab N` (la dimensione del
-BPE); `--batch` e `--accum` (accumulo del gradiente: il batch effettivo è il loro prodotto, la
-memoria è quella del solo `--batch`); `--grad-clip` (norma globale del gradiente, 1 per
-impostazione predefinita); `--lr`, `--warmup`, `--weight-decay`. `germen train --help` le elenca
-tutte. Aggiungete `--threads N` a qualsiasi comando per limitare il numero di thread di lavoro
-(predefinito: tutti i processori logici). I messaggi della riga di comando sono per ora solo in
-rumeno.
+Opzioni di addestramento da conoscere: `--tokenizer byte|bpe` e `--vocab N` (la dimensione del BPE);
+`--batch` e `--accum` (accumulo del gradiente: il batch effettivo è il loro prodotto, la memoria è
+quella del solo `--batch`); `--replicas N` (copie del modello che si dividono ogni micro-batch tra i
+thread; 0 = automatico, 1 = disattivato; scegliete un `--batch` almeno pari al numero di thread);
+`--grad-clip` (norma globale del gradiente, 1 per impostazione predefinita); `--lr`, `--warmup`,
+`--weight-decay`. `germen train --help` le elenca tutte. Aggiungete `--threads N` a qualsiasi
+comando per limitare il numero di thread di lavoro (predefinito: tutti i processori logici). I
+messaggi della riga di comando sono per ora solo in rumeno.
 
 ## Dimensioni dei modelli
 
@@ -92,26 +93,27 @@ Il costo dell'addestramento è circa **6 × parametri × token** operazioni in v
 byte, 1 MB di testo = 1 milione di token). Dividete per ciò che la vostra CPU fornisce davvero e
 avete il tempo. `germen bench` misura esattamente questo sul vostro computer.
 
-Misura di riferimento — una piccola macchina virtuale Linux con **2 core** (AVX-512), batch
-16 × 256, vocabolario di byte (una sola esecuzione su una macchina virtuale rumorosa, quindi
-± 5 %):
+Misura di riferimento — una piccola macchina virtuale Linux con **2 core** (AVX-512), batch 16 ×
+256, vocabolario di byte, impostazioni predefinite (mediana di cinque esecuzioni alternate su una
+macchina virtuale rumorosa, quindi ± 10 %):
 
 | nome | token/s | GFLOPS effettivi | 100 M token | 1 mld. token |
 |---|---:|---:|---:|---:|
-| `nano` | 8.261 | 54 | 3,4 h | 1,4 giorni |
-| `micro` | 3.180 | 63 | 8,7 h | 3,6 giorni |
-| `mini` | 1.260 | 90 | 22,0 h | 9,2 giorni |
-| `small` | 545 | 90 | 2,1 giorni | 21 giorni |
+| `nano` | 8.366 | 54 | 3,3 h | 1,4 giorni |
+| `micro` | 3.981 | 79 | 7,0 h | 2,9 giorni |
+| `mini` | 1.464 | 104 | 19,0 h | 7,9 giorni |
+| `small` | 647 | 106 | 1,8 giorni | 18 giorni |
 
-Passare da 1 a 2 thread ha reso `mini` 1,51× più veloce qui (825 → 1.247 token/s), quindi non
-aspettatevi che 20 core diano 20×. I prodotti di matrici scalano bene (≈ 1,8× su due thread);
-l'attenzione meno (≈ 1,2×), e RMSNorm, gli embedding rotatori e l'aggiornamento di AdamW quasi per
-niente, perciò su una macchina con molti core diventano il collo di bottiglia (legge di Amdahl). È
-a questo che serve `germen bench --scaling`: stampa l'intera curva e il numero di thread oltre il
-quale non si guadagna più nulla. **Eseguite `germen bench --scaling --json bench.json` sul vostro
-computer** — è l'unico modo per saperlo. Una regola empirica per l'addestramento ottimale in
-termini di calcolo è di circa 20 token per parametro; i modelli piccoli vengono spesso addestrati
-su molto di più.
+Passare da 1 a 2 thread ha reso `mini` 2,04× più veloce qui (733 → 1.494 token/s; 1,41× con
+`--replicas 1`), quindi non aspettatevi che 20 core diano 20×. In un singolo grafo i prodotti di
+matrici scalano bene (≈ 1,8× su due thread), l'attenzione meno (≈ 1,2×), e RMSNorm, gli embedding
+rotatori e l'aggiornamento di AdamW quasi per niente; le repliche della versione 0.3 eseguono queste
+parti affiancate, ma richiedono almeno tante finestre per batch quanti sono i thread. Fin dove
+arrivi questo su molti core non è stato misurato: a questo serve `germen bench --scaling`, che
+stampa l'intera curva e il numero di thread oltre il quale non si guadagna più nulla. **Eseguite
+`germen bench --scaling --json bench.json` sul vostro computer** — è l'unico modo per saperlo. Una
+regola empirica per l'addestramento ottimale in termini di calcolo è di circa 20 token per
+parametro; i modelli piccoli vengono spesso addestrati su molto di più.
 
 La generazione usa una cache chiave/valore: 400 token con `mini` richiedono circa 1 secondo invece
 di 15 sugli stessi due core.
@@ -142,31 +144,41 @@ crates/germen-cli    la riga di comando `germen` (clap)
   token e bit per byte), checkpoint atomici, avanzamento tramite eventi (`Event`) così che
   un'interfaccia grafica possa riusare lo stesso ciclo.
 * **Thread** — l'intero comando gira come un lavoratore di un proprio pool di thread, che avvia i
-  cicli paralleli senza passaggi di consegne tra thread (+ 7 % per `mini`, fino a + 25 % per
-  `nano`, su due core). Distribuire micro-batch su più thread che pilotano tutti Burn è stato
-  provato e scartato; vedere [docs/PLAN.md](docs/PLAN.md).
+  cicli paralleli senza passaggi di consegne tra thread (+ 7 % per `mini`, fino a + 25 % per `nano`,
+  su due core). Inoltre ogni micro-batch è diviso in **repliche di dati paralleli**: copie del
+  modello, ciascuna con un proprio grafo di differenziazione automatica, eseguono avanti e indietro
+  su thread diversi, e i loro gradienti vengono sommati in un ordine fisso, così un'esecuzione è
+  riproducibile per un dato numero di thread e di repliche (da + 23 % a + 44 % su due core a seconda
+  del modello, con un picco di memoria più basso; `--replicas 1` dà il passo ordinario). Distribuire
+  i micro-batch su thread che condividevano tutti un solo grafo è stato provato nella 0.2 e
+  scartato; vedere [docs/PLAN.md](docs/PLAN.md).
 * **Checkpoint** — una cartella con `config.json`, `weights.bpk` (il formato burnpack di Burn,
   f32), `optimizer.bpk` (i momenti di AdamW), `tokenizer.json` e `meta.json`. I checkpoint
   scritti dalla versione 0.1 si caricano ancora.
-* **Test** — 70 test unitari, tra cui: l'attenzione è causale, l'attenzione a blocchi è uguale a
-  quella di Burn (valori e gradienti), la generazione con cache è uguale al passaggio completo, i
-  micro-batch accumulati equivalgono a un batch grande, un passo di ottimizzazione dopo il
-  ricaricamento dello stato di AdamW è uguale a quello di un addestramento ininterrotto, ogni
-  sequenza di byte sopravvive all'andata e ritorno col BPE.
+* **Test** — 117 test (unitari della libreria e della riga di comando, più esecuzioni complete del
+  binario vero), tra cui: l'attenzione è causale, l'attenzione a blocchi è uguale a quella di Burn
+  (valori e gradienti), la generazione con cache è uguale al passaggio completo, i micro-batch
+  accumulati equivalgono a un batch grande, le repliche danno i gradienti di un solo grande grafo e
+  un'esecuzione è riproducibile bit per bit, un passo di ottimizzazione dopo il ricaricamento dello
+  stato di AdamW è uguale a quello di un addestramento ininterrotto, un checkpoint non resta mai
+  scritto a metà e i pesi non finiti non vengono mai salvati, i file ostili di tokenizer e
+  configurazione vengono rifiutati, ogni sequenza di byte sopravvive all'andata e ritorno col BPE.
+  L'audit avversariale è in [docs/AUDIT.md](docs/AUDIT.md).
 
-## Limiti (versione 0.2)
+## Limiti (versione 0.3)
 
 * L'intero corpus viene letto in memoria (come identificatori a 16 bit); sono previsti corpus
   mappati in memoria più grandi della RAM.
-* Alcune operazioni del passo (RMSNorm, embedding rotatori, aggiornamento di AdamW) non sfruttano
-  ancora bene i core aggiuntivi; renderle parallele è il principale punto aperto sulle prestazioni.
+* In un singolo grafo alcune operazioni del passo (RMSNorm, embedding rotatori, aggiornamento di
+  AdamW) non sfruttano bene i core aggiuntivi; le repliche lo nascondono quando `--batch` è almeno
+  pari al numero di thread, ma fin dove arrivi su molti core non è ancora misurato.
 * Niente precisione mista e niente backend GPU.
 * Il corpus `demo` è sintetico e minuscolo: dimostra che la catena impara, nient'altro.
 * Non ancora misurato su Windows, macOS o su una macchina con molti core — sopra è spiegato come
   aiutare.
 
-Vedere [CHANGELOG.md](CHANGELOG.md) e [docs/PLAN.md](docs/PLAN.md). I contributi sono benvenuti
-([CONTRIBUTING.md](CONTRIBUTING.md)).
+Vedere [CHANGELOG.md](CHANGELOG.md), [docs/PLAN.md](docs/PLAN.md) e [docs/AUDIT.md](docs/AUDIT.md).
+I contributi sono benvenuti ([CONTRIBUTING.md](CONTRIBUTING.md)).
 
 ## Licenza
 

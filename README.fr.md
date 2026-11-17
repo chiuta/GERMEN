@@ -64,12 +64,13 @@ d'AdamW sont restaurés, l'entraînement continue donc sans la remontée de la p
 | `germen generate` | génère du texte à partir d'un modèle entraîné, avec un cache clé/valeur (`--temperature`, `--top-k`, `--prompt`) |
 
 Options d'entraînement à connaître : `--tokenizer byte|bpe` et `--vocab N` (la taille du BPE) ;
-`--batch` et `--accum` (accumulation de gradients : le lot effectif est leur produit, la mémoire
-est celle de `--batch` seul) ; `--grad-clip` (norme globale du gradient, 1 par défaut) ; `--lr`,
-`--warmup`, `--weight-decay`. `germen train --help` les liste toutes. Ajoutez `--threads N` à
-n'importe quelle commande pour limiter le nombre de threads de travail (par défaut : tous les
-processeurs logiques). Les messages de la ligne de commande sont pour l'instant uniquement en
-roumain.
+`--batch` et `--accum` (accumulation de gradients : le lot effectif est leur produit, la mémoire est
+celle de `--batch` seul) ; `--replicas N` (copies du modèle qui se partagent chaque micro-lot entre
+les threads ; 0 = automatique, 1 = désactivé ; choisissez un `--batch` au moins égal au nombre de
+threads) ; `--grad-clip` (norme globale du gradient, 1 par défaut) ; `--lr`, `--warmup`,
+`--weight-decay`. `germen train --help` les liste toutes. Ajoutez `--threads N` à n'importe quelle
+commande pour limiter le nombre de threads de travail (par défaut : tous les processeurs logiques).
+Les messages de la ligne de commande sont pour l'instant uniquement en roumain.
 
 ## Tailles de modèle
 
@@ -94,24 +95,26 @@ processeur fournit réellement et vous avez la durée. `germen bench` mesure exa
 votre machine.
 
 Mesure de référence — une petite machine virtuelle Linux à **2 cœurs** (AVX-512), lot 16 × 256,
-vocabulaire d'octets (une seule exécution sur une machine virtuelle bruitée, donc ± 5 %) :
+vocabulaire d'octets, réglages par défaut (médiane de cinq exécutions entrelacées sur une machine
+virtuelle bruitée, donc ± 10 %) :
 
 | nom | tokens/s | GFLOPS effectifs | 100 M tokens | 1 Md tokens |
 |---|---:|---:|---:|---:|
-| `nano` | 8 261 | 54 | 3,4 h | 1,4 j |
-| `micro` | 3 180 | 63 | 8,7 h | 3,6 j |
-| `mini` | 1 260 | 90 | 22,0 h | 9,2 j |
-| `small` | 545 | 90 | 2,1 j | 21 j |
+| `nano` | 8 366 | 54 | 3,3 h | 1,4 j |
+| `micro` | 3 981 | 79 | 7,0 h | 2,9 j |
+| `mini` | 1 464 | 104 | 19,0 h | 7,9 j |
+| `small` | 647 | 106 | 1,8 j | 18 j |
 
-Passer de 1 à 2 threads a rendu `mini` 1,51× plus rapide ici (825 → 1 247 tokens/s) ; n'attendez
-donc pas de 20 cœurs un gain de 20×. Les produits de matrices passent bien à l'échelle (≈ 1,8× sur
-deux threads) ; l'attention un peu moins (≈ 1,2×), et RMSNorm, les embeddings rotatifs et la mise à
-jour d'AdamW presque pas du tout : sur une machine à nombreux cœurs, ils deviennent le goulot
-d'étranglement (loi d'Amdahl). C'est à cela que sert `germen bench --scaling` : il affiche toute la
-courbe et le nombre de threads au-delà duquel on ne gagne plus rien. **Lancez
-`germen bench --scaling --json bench.json` sur votre machine** — c'est le seul moyen de savoir. Une
-règle empirique pour un entraînement optimal en calcul est d'environ 20 tokens par paramètre ; les
-petits modèles sont souvent entraînés sur beaucoup plus.
+Passer de 1 à 2 threads a rendu `mini` 2,04× plus rapide ici (733 → 1 494 tokens/s ; 1,41× avec
+`--replicas 1`) ; n'attendez donc pas de 20 cœurs un gain de 20×. Dans un seul graphe, les produits
+de matrices passent bien à l'échelle (≈ 1,8× sur deux threads), l'attention un peu moins (≈ 1,2×),
+et RMSNorm, les embeddings rotatifs et la mise à jour d'AdamW presque pas du tout ; les répliques de
+la version 0.3 exécutent ces parties côte à côte, mais il leur faut au moins autant de fenêtres par
+lot que de threads. Jusqu'où cela va sur de nombreux cœurs n'a pas été mesuré : c'est à cela que
+sert `germen bench --scaling`, qui affiche toute la courbe et le nombre de threads au-delà duquel on
+ne gagne plus rien. **Lancez `germen bench --scaling --json bench.json` sur votre machine** — c'est
+le seul moyen de savoir. Une règle empirique pour un entraînement optimal en calcul est d'environ 20
+tokens par paramètre ; les petits modèles sont souvent entraînés sur beaucoup plus.
 
 La génération utilise un cache clé/valeur : 400 tokens avec `mini` prennent environ 1 seconde au
 lieu de 15 sur les deux mêmes cœurs.
@@ -143,31 +146,41 @@ crates/germen-cli    la ligne de commande `germen` (clap)
   événements (`Event`) pour qu'une interface graphique puisse réutiliser la même boucle.
 * **Threads** — toute la commande s'exécute comme un travailleur de son propre pool de threads, ce
   qui lance les boucles parallèles sans passage de relais entre threads (+ 7 % pour `mini`, jusqu'à
-  + 25 % pour `nano`, sur deux cœurs). Répartir des micro-lots sur plusieurs threads qui pilotent
-  tous Burn a été essayé et rejeté ; voir [docs/PLAN.md](docs/PLAN.md).
+  + 25 % pour `nano`, sur deux cœurs). De plus, chaque micro-lot est réparti en **répliques de
+  données parallèles** : des copies du modèle, chacune avec son propre graphe de différentiation
+  automatique, exécutent l'aller et le retour sur des threads différents, et leurs gradients sont
+  additionnés dans un ordre fixe, de sorte qu'une exécution est reproductible pour un nombre donné
+  de threads et de répliques (de + 23 % à + 44 % sur deux cœurs selon le modèle, avec un pic de
+  mémoire plus bas ; `--replicas 1` donne le pas ordinaire). Répartir des micro-lots sur des threads
+  partageant tous un même graphe a été essayé en 0.2 et rejeté ; voir [docs/PLAN.md](docs/PLAN.md).
 * **Point de contrôle** — un dossier avec `config.json`, `weights.bpk` (le format burnpack de Burn,
   f32), `optimizer.bpk` (les moments d'AdamW), `tokenizer.json` et `meta.json`. Les points de
   contrôle écrits par la version 0.1 se chargent toujours.
-* **Tests** — 70 tests unitaires, dont : l'attention est causale, l'attention par blocs égale celle
-  de Burn (valeurs et gradients), la génération avec cache égale la passe complète, des
-  micro-lots accumulés valent un grand lot, un pas d'optimisation après rechargement de l'état
-  d'AdamW égale celui d'un entraînement ininterrompu, toute suite d'octets survit à l'aller-retour
-  par le BPE.
+* **Tests** — 117 tests (unitaires de la bibliothèque et de la ligne de commande, plus des
+  exécutions complètes du vrai binaire), dont : l'attention est causale, l'attention par blocs égale
+  celle de Burn (valeurs et gradients), la génération avec cache égale la passe complète, des
+  micro-lots accumulés valent un grand lot, les répliques donnent les gradients d'un seul grand
+  graphe et une exécution est reproductible au bit près, un pas d'optimisation après rechargement de
+  l'état d'AdamW égale celui d'un entraînement ininterrompu, un point de contrôle n'est jamais
+  laissé à moitié écrit et des poids non finis ne sont jamais enregistrés, les fichiers hostiles de
+  tokenizer et de configuration sont refusés, toute suite d'octets survit à l'aller-retour par le
+  BPE. L'audit adversarial est dans [docs/AUDIT.md](docs/AUDIT.md).
 
-## Limites (version 0.2)
+## Limites (version 0.3)
 
 * Tout le corpus est lu en mémoire (sous forme d'identifiants de 16 bits) ; des corpus mappés en
   mémoire, plus grands que la RAM, sont prévus.
-* Quelques opérations du pas (RMSNorm, embeddings rotatifs, mise à jour d'AdamW) n'exploitent pas
-  encore bien les cœurs supplémentaires ; les paralléliser est le principal chantier de
-  performance ouvert.
+* Dans un seul graphe, quelques opérations du pas (RMSNorm, embeddings rotatifs, mise à jour
+  d'AdamW) n'exploitent pas bien les cœurs supplémentaires ; les répliques masquent cela quand
+  `--batch` est au moins égal au nombre de threads, mais jusqu'où cela va sur de nombreux cœurs
+  n'est pas encore mesuré.
 * Pas de précision mixte ni de backend GPU.
 * Le corpus `demo` est synthétique et minuscule : il prouve que la chaîne apprend, rien de plus.
 * Pas encore mesuré sous Windows, macOS ni sur une machine à nombreux cœurs — voir plus haut
   comment aider.
 
-Voir [CHANGELOG.md](CHANGELOG.md) et [docs/PLAN.md](docs/PLAN.md). Les contributions sont les
-bienvenues ([CONTRIBUTING.md](CONTRIBUTING.md)).
+Voir [CHANGELOG.md](CHANGELOG.md), [docs/PLAN.md](docs/PLAN.md) et [docs/AUDIT.md](docs/AUDIT.md).
+Les contributions sont les bienvenues ([CONTRIBUTING.md](CONTRIBUTING.md)).
 
 ## Licence
 

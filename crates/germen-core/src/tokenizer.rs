@@ -14,6 +14,7 @@
 //! useless without the exact vocabulary it was trained with.
 
 use crate::bpe::Bpe;
+use crate::fsutil::Staged;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::Path;
@@ -117,8 +118,8 @@ impl Tokenizer {
         out
     }
 
-    /// Writes `tokenizer.json` into `dir` (atomically).
-    pub fn save(&self, dir: &Path) -> Result<(), String> {
+    /// The content of `tokenizer.json` for this tokenizer.
+    pub fn to_json(&self) -> Result<String, String> {
         let stored = match self {
             Tokenizer::Byte => Stored {
                 kind: "byte".into(),
@@ -131,12 +132,15 @@ impl Tokenizer {
                 merges: b.merges().to_vec(),
             },
         };
-        let json = serde_json::to_string(&stored).map_err(|e| e.to_string())?;
-        fs::create_dir_all(dir).map_err(|e| format!("nu pot crea {}: {e}", dir.display()))?;
-        let path = dir.join(TOKENIZER_FILE);
-        let tmp = dir.join(format!("{TOKENIZER_FILE}.tmp"));
-        fs::write(&tmp, json).map_err(|e| format!("nu pot scrie {}: {e}", tmp.display()))?;
-        fs::rename(&tmp, &path).map_err(|e| format!("nu pot redenumi în {}: {e}", path.display()))
+        serde_json::to_string(&stored).map_err(|e| e.to_string())
+    }
+
+    /// Writes `tokenizer.json` into `dir` (created if missing), atomically and durably: a
+    /// crash leaves either the old file or the new one, never a half-written one.
+    pub fn save(&self, dir: &Path) -> Result<(), String> {
+        let mut staged = Staged::new(dir)?;
+        staged.bytes(TOKENIZER_FILE, self.to_json()?.as_bytes())?;
+        staged.commit()
     }
 
     /// Reads the tokenizer stored in `dir`. A directory without `tokenizer.json` (every
@@ -361,6 +365,16 @@ mod tests {
         assert!(Tokenizer::load(&dir).unwrap_err().contains("necunoscut"));
         write(r#"{"kind":"bpe","vocab_size":258,"merges":[[300,1]]}"#);
         assert!(Tokenizer::load(&dir).is_err());
+        // 60 merges, each doubling the longest token: a few hundred bytes of JSON that used to
+        // ask for an exabyte.
+        let doubling: Vec<String> = std::iter::once("[97,97]".to_string())
+            .chain((0..60).map(|k| format!("[{},{}]", 256 + k, 256 + k)))
+            .collect();
+        write(&format!(
+            r#"{{"kind":"bpe","vocab_size":317,"merges":[{}]}}"#,
+            doubling.join(",")
+        ));
+        assert!(Tokenizer::load(&dir).unwrap_err().contains("octeți"));
         write(r#"{"kind":"bpe","vocab_size":999,"merges":[[97,98]]}"#);
         assert!(
             Tokenizer::load(&dir)

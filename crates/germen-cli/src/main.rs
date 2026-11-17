@@ -1,6 +1,7 @@
 //! `germen` — command-line front end of GERMEN.
 //!
 //! Subcommands: `info`, `bench`, `demo-corpus`, `train`, `generate`.
+#![deny(unsafe_code)]
 
 use clap::{Args, Parser, Subcommand};
 use germen_core::bench::{
@@ -68,6 +69,12 @@ struct BenchArgs {
     /// Pași cronometrați pentru fiecare model
     #[arg(long, default_value_t = 4)]
     steps: usize,
+    /// Replici de date paralele pe pas: lotul se împarte între copii ale modelului, fiecare cu
+    /// graful ei, pe fire diferite (0 = automat: câte una pe fir, cel mult ferestrele lotului; 1 =
+    /// pasul obișnuit, pentru comparație). Mai multe replici decât fire pot ajuta modelele mici și
+    /// strica pe cele mari: măsurați
+    #[arg(long, default_value_t = 0)]
+    replicas: usize,
     /// Pași de încălzire, necronometrați
     #[arg(long, default_value_t = 2)]
     warmup: usize,
@@ -139,6 +146,13 @@ struct TrainArgs {
     /// Numărul total de pași de antrenare
     #[arg(long, default_value_t = 2000)]
     steps: usize,
+    /// Replici de date paralele: ferestrele unui micro-lot se împart între copii ale modelului,
+    /// fiecare cu graful ei de gradiente, pe fire diferite (0 = automat: câte una pe fir, cel mult
+    /// ferestrele lotului; 1 = pasul obișnuit). Pentru folosirea deplină a procesorului alegeți un
+    /// --batch cel puțin egal cu numărul de fire. Mai multe replici decât fire pot ajuta modelele
+    /// mici și strica pe cele mari: măsurați cu `germen bench --replicas N`
+    #[arg(long, default_value_t = 0)]
+    replicas: usize,
     /// Rata de învățare maximă
     #[arg(long, default_value_t = 6e-4)]
     lr: f64,
@@ -345,6 +359,7 @@ fn cmd_bench(a: BenchArgs, threads_flag_given: bool) -> Result<(), String> {
             seq: a.seq,
             warmup: a.warmup,
             steps: a.steps,
+            replicas: a.replicas,
         };
         for p in presets {
             eprintln!("  {}:", p.name());
@@ -373,10 +388,11 @@ fn cmd_bench(a: BenchArgs, threads_flag_given: bool) -> Result<(), String> {
                 a.seq,
                 a.warmup,
                 a.steps,
+                a.replicas,
             )?;
             eprintln!(
-                "{:.0} ms/pas · {:.0} tokeni/s",
-                r.ms_per_step, r.tokens_per_sec
+                "{:.0} ms/pas · {:.0} tokeni/s ({} replici)",
+                r.ms_per_step, r.tokens_per_sec, r.replicas
             );
             report.results.push(r);
         }
@@ -391,11 +407,30 @@ fn cmd_bench(a: BenchArgs, threads_flag_given: bool) -> Result<(), String> {
     Ok(())
 }
 
-fn cmd_demo(a: DemoArgs) -> Result<(), String> {
-    if !(a.size_mb > 0.0 && a.size_mb <= 1024.0) {
-        return Err("--size-mb trebuie să fie între 0 și 1024".into());
+/// A size given in MiB on the command line, in bytes. Zero, negative, NaN and absurd values are
+/// refused: casting `1e300` to `usize` saturates, and the program would then try to build a
+/// text of 16 EiB.
+fn mib_to_bytes(flag: &str, mib: f64, max_mib: f64) -> Result<usize, String> {
+    if !(mib.is_finite() && mib > 0.0 && mib <= max_mib) {
+        return Err(format!(
+            "{flag} trebuie să fie între 0 și {max_mib} (în MiB), nu {mib}"
+        ));
     }
-    let text = demo_corpus((a.size_mb * 1024.0 * 1024.0) as usize, a.seed);
+    Ok((mib * 1024.0 * 1024.0) as usize)
+}
+
+/// The share of the text kept for validation: `[0, 0.5)`.
+fn check_val_fraction(fraction: f64) -> Result<(), String> {
+    if !(0.0..0.5).contains(&fraction) {
+        return Err(format!(
+            "--val-fraction trebuie să fie în [0, 0.5), nu {fraction}"
+        ));
+    }
+    Ok(())
+}
+
+fn cmd_demo(a: DemoArgs) -> Result<(), String> {
+    let text = demo_corpus(mib_to_bytes("--size-mb", a.size_mb, 1024.0)?, a.seed);
     std::fs::write(&a.out, &text).map_err(|e| format!("nu pot scrie {}: {e}", a.out.display()))?;
     println!(
         "Am scris {} ({:.2} MiB). Primele rânduri:\n",
@@ -426,12 +461,23 @@ fn sample_blocks(data: &[u8], budget: usize) -> Vec<u8> {
 }
 
 fn cmd_train(a: TrainArgs) -> Result<(), String> {
+    // Whatever can be checked without reading the text is checked before reading it.
+    check_val_fraction(a.val_fraction)?;
+    if a.val_fraction == 0.0 && a.eval_every > 0 {
+        eprintln!(
+            "avertisment: cu --val-fraction 0 nu există text de validare, așa că „validarea” se \
+             măsoară pe chiar textul de antrenare (nu arată supraînvățarea); \
+             folosiți --val-fraction 0.05 sau --eval-every 0"
+        );
+    }
     // Text.
     let text: Vec<u8> = match (&a.data, a.demo) {
         (Some(path), false) => {
             std::fs::read(path).map_err(|e| format!("nu pot citi {}: {e}", path.display()))?
         }
-        (None, true) => demo_corpus((a.demo_mb * 1024.0 * 1024.0) as usize, a.seed).into_bytes(),
+        (None, true) => {
+            demo_corpus(mib_to_bytes("--demo-mb", a.demo_mb, 1024.0)?, a.seed).into_bytes()
+        }
         _ => return Err("alegeți datele: --data FIȘIER sau --demo".into()),
     };
 
@@ -448,11 +494,9 @@ fn cmd_train(a: TrainArgs) -> Result<(), String> {
         }
         t
     } else if a.tokenizer == "bpe" {
-        if !(a.bpe_sample_mb > 0.0 && a.bpe_sample_mb <= 4096.0) {
-            return Err("--bpe-sample-mb trebuie să fie între 0 și 4096".into());
-        }
+        let budget = mib_to_bytes("--bpe-sample-mb", a.bpe_sample_mb, 4096.0)?;
         let train_part = &text[..split_point(text.len(), a.val_fraction)];
-        let sample = sample_blocks(train_part, (a.bpe_sample_mb * 1048576.0) as usize);
+        let sample = sample_blocks(train_part, budget);
         eprintln!(
             "Învăț vocabularul BPE ({} tokeni) din {:.1} MiB de text...",
             a.vocab,
@@ -510,6 +554,7 @@ fn cmd_train(a: TrainArgs) -> Result<(), String> {
         log_every: a.log_every,
         sample_every: a.sample_every,
         seed: a.seed,
+        replicas: a.replicas,
     };
 
     // Ctrl-C: finish the current step, save, exit. A second Ctrl-C quits at once.
@@ -520,7 +565,10 @@ fn cmd_train(a: TrainArgs) -> Result<(), String> {
             if stop.swap(true, Ordering::SeqCst) {
                 std::process::exit(130);
             }
-            eprintln!("\nOpresc după pasul curent și salvez (încă un Ctrl-C = ieșire imediată)...");
+            eprintln!(
+                "\nOpresc și salvez ultimul pas întreg (un pas început, cu --accum mare, se abandonează); \
+                 încă un Ctrl-C = ieșire imediată..."
+            );
         });
     }
 
@@ -544,6 +592,7 @@ fn cmd_train(a: TrainArgs) -> Result<(), String> {
                 bytes_per_token: bpt,
                 vocab_size,
                 optimizer_restored,
+                replicas,
             } => {
                 bytes_per_token = bpt;
                 println!(
@@ -557,6 +606,17 @@ fn cmd_train(a: TrainArgs) -> Result<(), String> {
                     train_tokens,
                     est_memory_bytes as f64 / 1073741824.0
                 );
+                let threads = sys::worker_threads();
+                if replicas == 1 {
+                    println!(
+                        "Calcul: {threads} fire de lucru, pasul obișnuit (o singură replică pe micro-lot)."
+                    );
+                } else {
+                    println!(
+                        "Calcul: {threads} fire de lucru, {replicas} replici pe micro-lot (cel mult {} deodată).",
+                        replicas.min(threads)
+                    );
+                }
                 if from_step > 0 {
                     println!(
                         "{}",
@@ -630,7 +690,13 @@ fn cmd_train(a: TrainArgs) -> Result<(), String> {
     )?;
 
     println!();
-    if report.interrupted {
+    if report.steps_run == 0 && !report.interrupted {
+        println!(
+            "Nimic de făcut: punctul de control e deja la pasul {} (= --steps). Pentru a continua \
+             antrenarea, dați un --steps mai mare.",
+            report.final_step
+        );
+    } else if report.interrupted {
         println!(
             "Oprit la pasul {} (poate fi reluat cu --resume).",
             report.final_step
@@ -710,4 +776,29 @@ fn cmd_generate(a: GenerateArgs) -> Result<(), String> {
     // A character cut off by --max-new is dropped rather than shown as a replacement mark.
     let _ = writeln!(out);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sizes_in_mib_are_checked() {
+        assert_eq!(mib_to_bytes("--x", 2.0, 1024.0).unwrap(), 2 * 1024 * 1024);
+        assert_eq!(mib_to_bytes("--x", 0.5, 1024.0).unwrap(), 512 * 1024);
+        for bad in [0.0, -1.0, f64::NAN, f64::INFINITY, 1e300, 1025.0] {
+            let err = mib_to_bytes("--x", bad, 1024.0).unwrap_err();
+            assert!(err.contains("--x"), "{bad}: {err}");
+        }
+    }
+
+    #[test]
+    fn the_validation_share_is_checked() {
+        for good in [0.0, 0.05, 0.499] {
+            assert!(check_val_fraction(good).is_ok(), "{good}");
+        }
+        for bad in [f64::NAN, -0.1, 0.5, 1.0, 7.0, f64::INFINITY] {
+            assert!(check_val_fraction(bad).is_err(), "{bad}");
+        }
+    }
 }

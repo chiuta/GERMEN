@@ -9,10 +9,28 @@ use std::path::Path;
 #[derive(Clone, Debug)]
 pub struct Rng(u64);
 
+/// One round of SplitMix64: a bijection on `u64` that spreads every bit of its input over the whole
+/// output, so that seeds which differ in a single bit start unrelated sequences.
+fn splitmix64(x: u64) -> u64 {
+    let mut z = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
+}
+
 impl Rng {
-    /// Creates a generator; a zero seed is remapped so the state is never all-zero.
+    /// Creates a generator. Different seeds give different sequences (all but one pair of the 2⁶⁴
+    /// seeds, because the all-zero state, which xorshift cannot leave, is remapped).
+    ///
+    /// Up to 0.2.0 the seed was only XOR-ed with a constant and its lowest bit forced to 1, so
+    /// seeds `2k` and `2k + 1` produced the same numbers.
     pub fn new(seed: u64) -> Self {
-        Rng(seed ^ 0x9E37_79B9_7F4A_7C15 | 1)
+        let state = splitmix64(seed);
+        Rng(if state == 0 {
+            0x9E37_79B9_7F4A_7C15
+        } else {
+            state
+        })
     }
 
     /// Next 64 random bits.
@@ -62,8 +80,16 @@ pub struct Corpus {
 /// Where the validation tail starts in a text of `len` bytes (everything before it is training
 /// data). A tokenizer should be trained on `text[..split_point(..)]` only, so that the
 /// validation text stays unseen.
+///
+/// Never panics: a fraction that is NaN or outside `[0, 1]` is clamped here, and it is
+/// [`Corpus::build`] that rejects it with a message.
 pub fn split_point(len: usize, val_fraction: f64) -> usize {
-    len - ((len as f64) * val_fraction) as usize
+    let fraction = if val_fraction.is_nan() {
+        0.0
+    } else {
+        val_fraction.clamp(0.0, 1.0)
+    };
+    len - (((len as f64) * fraction) as usize).min(len)
 }
 
 impl Corpus {
@@ -193,6 +219,27 @@ impl Batch {
         let x = Tensor::<2, Int>::from_data(TensorData::new(self.inputs.clone(), shape), device);
         let y = Tensor::<2, Int>::from_data(TensorData::new(self.targets.clone(), shape), device);
         (x, y)
+    }
+
+    /// Splits the windows into `parts` consecutive batches whose sizes differ by at most one
+    /// (the larger ones first). `parts` is clamped to `1..=batch`, so no part is ever empty.
+    pub fn split(&self, parts: usize) -> Vec<Batch> {
+        let parts = parts.clamp(1, self.batch.max(1));
+        let (each, extra) = (self.batch / parts, self.batch % parts);
+        let mut start = 0;
+        (0..parts)
+            .map(|i| {
+                let rows = each + usize::from(i < extra);
+                let (from, to) = (start * self.seq, (start + rows) * self.seq);
+                start += rows;
+                Batch {
+                    inputs: self.inputs[from..to].to_vec(),
+                    targets: self.targets[from..to].to_vec(),
+                    batch: rows,
+                    seq: self.seq,
+                }
+            })
+            .collect()
     }
 
     /// A batch of uniformly random tokens, for benchmarks (content is irrelevant to speed).
@@ -337,6 +384,70 @@ pub fn demo_corpus(target_bytes: usize, seed: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn splitting_a_batch_keeps_every_window_once_and_in_order() {
+        let mut rng = Rng::new(3);
+        let batch = Batch::random(7, 5, 256, &mut rng);
+        for parts in [1, 2, 3, 7, 50] {
+            let pieces = batch.split(parts);
+            assert_eq!(pieces.len(), parts.min(7));
+            assert!(pieces.iter().all(|p| p.batch >= 1 && p.seq == 5));
+            let (max, min) = (
+                pieces.iter().map(|p| p.batch).max().unwrap(),
+                pieces.iter().map(|p| p.batch).min().unwrap(),
+            );
+            assert!(max - min <= 1, "{parts}: sizes {max}/{min}");
+            let inputs: Vec<i32> = pieces.iter().flat_map(|p| p.inputs.clone()).collect();
+            let targets: Vec<i32> = pieces.iter().flat_map(|p| p.targets.clone()).collect();
+            assert_eq!(inputs, batch.inputs);
+            assert_eq!(targets, batch.targets);
+        }
+        assert_eq!(batch.split(0).len(), 1, "zero parts means one");
+    }
+
+    #[test]
+    fn every_seed_gives_its_own_stream() {
+        // Up to 0.2.0 the seeds 2k and 2k+1 started the very same sequence (`(seed ^ C) | 1`
+        // throws the lowest bit away), so "--seed 2" and "--seed 3" trained on identical data.
+        let mut seen = std::collections::HashSet::new();
+        for seed in 0..2000u64 {
+            let mut rng = Rng::new(seed);
+            let stream: Vec<u64> = (0..4).map(|_| rng.next_u64()).collect();
+            assert!(
+                seen.insert(stream),
+                "seed {seed} repeats the stream of an earlier seed"
+            );
+        }
+    }
+
+    #[test]
+    fn neighbouring_seeds_are_not_correlated() {
+        // The first draw of seeds 0, 1, 2, … must look unrelated: about half of the bits differ
+        // between neighbours (xorshift on a barely different state would not manage that).
+        let first = |seed: u64| Rng::new(seed).next_u64();
+        let mut differing = 0u32;
+        let pairs = 500u32;
+        for seed in 0..pairs as u64 {
+            differing += (first(seed) ^ first(seed + 1)).count_ones();
+        }
+        let mean = differing as f64 / pairs as f64;
+        assert!((28.0..36.0).contains(&mean), "mean differing bits: {mean}");
+    }
+
+    #[test]
+    fn split_point_survives_nonsense_fractions() {
+        assert_eq!(split_point(1000, 0.05), 950);
+        assert_eq!(split_point(1000, 0.0), 1000);
+        for fraction in [f64::NAN, -1.0, 7.0, f64::INFINITY, f64::NEG_INFINITY, 1e300] {
+            let at = split_point(1000, fraction);
+            assert!(at <= 1000, "split_point(1000, {fraction}) = {at}");
+        }
+        // The corpus builder is what rejects them, with a message.
+        for fraction in [f64::NAN, -0.1, 0.5, 7.0] {
+            assert!(Corpus::from_bytes(vec![b'a'; 1000], fraction).is_err());
+        }
+    }
 
     #[test]
     fn rng_is_deterministic_and_in_range() {

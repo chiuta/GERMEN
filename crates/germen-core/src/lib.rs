@@ -17,12 +17,16 @@
 //! * [`mod@bench`] — measuring training speed (and its scaling with threads) on this machine
 //! * [`sys`] — machine description and the worker pool a command should run in
 #![warn(missing_docs)]
+// The only `unsafe` in the workspace is one call to the Windows API in `sys::windows`, which allows it
+// for itself; anywhere else it is a compile error.
+#![deny(unsafe_code)]
 
 pub mod bench;
 pub mod bpe;
 pub mod checkpoint;
 pub mod config;
 pub mod data;
+mod fsutil;
 pub mod generate;
 pub mod gradients;
 pub mod model;

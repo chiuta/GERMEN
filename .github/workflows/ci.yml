@@ -9,6 +9,11 @@ on:
 permissions:
   contents: read
 
+# A newer push supersedes an older run of the same branch; a tag build (a release) is never cancelled.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref_type != 'tag' }}
+
 env:
   CARGO_TERM_COLOR: always
 
@@ -26,6 +31,19 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-targets --release -- -D warnings
+
+  msrv:
+    name: minimum supported Rust (1.95)
+    runs-on: ubuntu-26.04
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install the Rust version that Cargo.toml promises (rust-version)
+        run: |
+          rustup toolchain install 1.95 --profile minimal
+          rustup default 1.95
+          rustc --version
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --workspace --all-targets --locked
 
   test:
     name: test (${{ matrix.os }})
@@ -60,7 +78,17 @@ jobs:
           "$BIN" train --demo --demo-mb 0.2 --seq 64 --batch 4 --accum 2 \
                  --steps 60 --eval-every 20 --eval-batches 2 --log-every 10 \
                  --out ci-model --resume
+          # Resuming a run that is already complete is a quiet success (a "resume until done" loop ends)
+          "$BIN" train --demo --demo-mb 0.2 --seq 64 --batch 4 --accum 2 \
+                 --steps 60 --eval-every 20 --eval-batches 2 --log-every 10 \
+                 --out ci-model --resume
           "$BIN" generate --model ci-model --max-new 40 --seed 1
+          # Data-parallel replicas: forced above the number of threads, and switched off
+          "$BIN" train --demo --demo-mb 0.2 --preset nano --seq 64 --batch 8 --replicas 3 \
+                 --steps 20 --eval-every 10 --eval-batches 2 --log-every 10 --out ci-replicas
+          "$BIN" train --demo --demo-mb 0.2 --preset nano --seq 64 --batch 8 --replicas 1 \
+                 --steps 20 --eval-every 10 --eval-batches 2 --log-every 10 --out ci-single
+          "$BIN" bench --preset nano --batch 8 --seq 64 --steps 2 --warmup 1 --replicas 1
           "$BIN" train --demo --demo-mb 0.2 --preset nano --tokenizer bpe --vocab 400 \
                  --seq 64 --batch 8 --steps 30 --eval-every 15 --eval-batches 2 \
                  --log-every 10 --out ci-bpe

@@ -98,7 +98,7 @@ mod tests {
     #[test]
     fn global_norm_matches_a_manual_computation() {
         let device = Device::flex().autodiff();
-        let model = Preset::Nano.config(16).init(&device);
+        let model = Preset::Nano.config(16).init_seeded(&device, 1);
         let (x, y) = batch(&device, 0..3, 16);
         let grads = GradientsParams::from_grads(model.loss(x, y).backward(), &model);
         let manual = all_grads(&grads, &model)
@@ -114,7 +114,7 @@ mod tests {
     #[test]
     fn clipping_scales_all_gradients_equally_and_only_when_needed() {
         let device = Device::flex().autodiff();
-        let model = Preset::Nano.config(16).init(&device);
+        let model = Preset::Nano.config(16).init_seeded(&device, 1);
         let (x, y) = batch(&device, 0..3, 16);
         let original = GradientsParams::from_grads(model.loss(x, y).backward(), &model);
         let norm = global_norm(&original, &model);
@@ -142,7 +142,7 @@ mod tests {
     #[test]
     fn accumulated_micro_batches_equal_one_big_batch() {
         let device = Device::flex().autodiff();
-        let model = Preset::Nano.config(16).init(&device);
+        let model = Preset::Nano.config(16).init_seeded(&device, 1);
 
         let (x, y) = batch(&device, 0..8, 16);
         let whole = GradientsParams::from_grads(model.loss(x, y).backward(), &model);

@@ -59,12 +59,13 @@ training goes on without the loss bump of a cold restart (the random text window
 | `germen train` | trains from scratch (`--data FILE` or `--demo`), or continues with `--resume` |
 | `germen generate` | samples text from a trained model, with a key/value cache (`--temperature`, `--top-k`, `--prompt`) |
 
-Training options worth knowing: `--tokenizer byte|bpe` and `--vocab N` (the BPE size);
-`--batch` and `--accum` (gradient accumulation: the effective batch is their product, the memory
-is that of `--batch` alone); `--grad-clip` (global gradient norm, default 1); `--lr`, `--warmup`,
-`--weight-decay`. `germen train --help` lists them all. Add `--threads N` to any command to limit
-the number of worker threads (the default is every logical processor). The messages of the command
-line are currently in Romanian.
+Training options worth knowing: `--tokenizer byte|bpe` and `--vocab N` (the BPE size); `--batch` and
+`--accum` (gradient accumulation: the effective batch is their product, the memory is that of
+`--batch` alone); `--replicas N` (copies of the model that share each micro-batch between threads; 0
+= automatic, 1 = off; choose a `--batch` at least as large as the number of threads); `--grad-clip`
+(global gradient norm, default 1); `--lr`, `--warmup`, `--weight-decay`. `germen train --help` lists
+them all. Add `--threads N` to any command to limit the number of worker threads (the default is
+every logical processor). The messages of the command line are currently in Romanian.
 
 ## Model sizes
 
@@ -87,23 +88,25 @@ The cost of training is about **6 × parameters × tokens** floating-point opera
 `germen bench` measures exactly that on your machine.
 
 Reference measurement — a small Linux virtual machine with **2 cores** (AVX-512), batch 16 × 256,
-byte vocabulary (one run on a noisy VM, so ± 5 %):
+byte vocabulary, default settings (median of five interleaved runs on a noisy VM, so ± 10 %):
 
 | preset | tokens/s | effective GFLOPS | 100 M tokens | 1 B tokens |
 |---|---:|---:|---:|---:|
-| `nano` | 8,261 | 54 | 3.4 h | 1.4 d |
-| `micro` | 3,180 | 63 | 8.7 h | 3.6 d |
-| `mini` | 1,260 | 90 | 22.0 h | 9.2 d |
-| `small` | 545 | 90 | 2.1 d | 21 d |
+| `nano` | 8,366 | 54 | 3.3 h | 1.4 d |
+| `micro` | 3,981 | 79 | 7.0 h | 2.9 d |
+| `mini` | 1,464 | 104 | 19.0 h | 7.9 d |
+| `small` | 647 | 106 | 1.8 d | 18 d |
 
-Going from 1 to 2 threads made `mini` 1.51× faster here (825 → 1,247 tokens/s), so do not expect
-20 cores to give 20×. Matrix products scale well (≈ 1.8× on two threads); attention scales
-less (≈ 1.2×), and RMSNorm, rotary embeddings and the AdamW update hardly at all, so on a machine
-with many cores they become the bottleneck (Amdahl's law). That is what
-`germen bench --scaling` is for: it prints the whole curve and the number of threads beyond which
-nothing is gained. **Please run `germen bench --scaling --json bench.json` on your machine** — it
-is the only way to know. A common rule of thumb for compute-optimal training is about 20 tokens
-per parameter; small models are often trained on much more.
+Going from 1 to 2 threads made `mini` 2.04× faster here (733 → 1,494 tokens/s; 1.41× with
+`--replicas 1`), so do not expect 20 cores to give 20×. Inside one graph, matrix products scale well
+(≈ 1.8× on two threads), attention less (≈ 1.2×), and RMSNorm, rotary embeddings and the AdamW
+update hardly at all; the replicas of version 0.3 run these parts side by side, but they need at
+least as many windows per batch as there are threads. How far that carries on many cores has not
+been measured: that is what `germen bench --scaling` is for — it prints the whole curve and the
+number of threads beyond which nothing is gained. **Please run `germen bench --scaling --json
+bench.json` on your machine** — it is the only way to know. A common rule of thumb for
+compute-optimal training is about 20 tokens per parameter; small models are often trained on much
+more.
 
 Generation uses a key/value cache: 400 tokens from `mini` take about 1 second instead of 15 on the
 same two cores.
@@ -132,29 +135,38 @@ crates/germen-cli    the `germen` command line (clap)
   bits per byte), atomic checkpoints, progress through `Event` callbacks so a graphical front end
   can reuse the same loop.
 * **Threads** — the whole command runs as one worker of its own thread pool, which starts parallel
-  loops without a hand-off between threads (+ 7 % for `mini` to + 25 % for `nano` on two cores).
-  Spreading micro-batches over several threads that all drive Burn was tried and rejected; see
-  [docs/PLAN.md](docs/PLAN.md).
+  loops without a hand-off between threads (+ 7 % for `mini` to + 25 % for `nano` on two cores). On
+  top of that every micro-batch is split into **data-parallel replicas**: copies of the model, each
+  with an autodiff graph of its own, run forward and backward on different threads and their
+  gradients are added in a fixed order, so a run is reproducible for a given number of threads and
+  replicas (+ 23 % to + 44 % on two cores, depending on the model, with a lower memory peak;
+  `--replicas 1` gives the ordinary step). Spreading micro-batches over threads that all shared one
+  graph was tried in 0.2 and rejected; see [docs/PLAN.md](docs/PLAN.md).
 * **Checkpoint** — a folder with `config.json`, `weights.bpk` (Burn's burnpack, f32),
   `optimizer.bpk` (AdamW moments), `tokenizer.json` and `meta.json`. Checkpoints written by
   version 0.1 still load.
-* **Tests** — 70 unit tests, among them: attention is causal, block attention equals Burn's
-  attention (values and gradients), cached generation equals the full forward pass, accumulated
-  micro-batches equal one large batch, an optimizer step after reloading the AdamW state equals
-  the step of an uninterrupted run, every byte sequence survives the BPE round trip.
+* **Tests** — 117 tests (unit tests of the library and of the command line, and end-to-end runs of
+  the real binary), among them: attention is causal, block attention equals Burn's attention (values
+  and gradients), cached generation equals the full forward pass, accumulated micro-batches equal
+  one large batch, replicas give the gradients of one big graph and a run is reproducible bit for
+  bit, an optimizer step after reloading the AdamW state equals the step of an uninterrupted run, a
+  checkpoint is never left half-written and non-finite weights are never saved, hostile tokenizer
+  and configuration files are refused, every byte sequence survives the BPE round trip. The
+  adversarial audit is in [docs/AUDIT.md](docs/AUDIT.md).
 
-## Limitations (version 0.2)
+## Limitations (version 0.3)
 
 * The whole corpus is read into memory (as 16-bit token ids); memory-mapped corpora larger than
   RAM are planned.
-* Several operations of the step (RMSNorm, rotary embeddings, the AdamW update) do not use extra
-  cores well yet; making them parallel is the main open performance item.
+* Inside one graph several operations of the step (RMSNorm, rotary embeddings, the AdamW update) do
+  not use extra cores well; replicas hide this when `--batch` is at least the number of threads, but
+  how far that carries on many cores has not been measured yet.
 * No mixed precision and no GPU backend.
 * The `demo` corpus is synthetic and tiny: it proves the pipeline learns, nothing more.
 * Not yet measured on Windows, macOS or a machine with many cores — see above for how to help.
 
-See [CHANGELOG.md](CHANGELOG.md) and [docs/PLAN.md](docs/PLAN.md). Contributions are welcome —
-the open issues are a good start ([CONTRIBUTING.md](CONTRIBUTING.md)).
+See [CHANGELOG.md](CHANGELOG.md), [docs/PLAN.md](docs/PLAN.md) and [docs/AUDIT.md](docs/AUDIT.md).
+Contributions are welcome — the open issues are a good start ([CONTRIBUTING.md](CONTRIBUTING.md)).
 
 ## License
 

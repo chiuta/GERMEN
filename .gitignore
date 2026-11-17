@@ -1,7 +1,6 @@
 /target
 /germen-model/
-/ci-model/
+/ci-*/
 *.bpk
 /demo.txt
 /bench*.json
-/ci-bpe/

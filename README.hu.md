@@ -63,9 +63,11 @@ visszaáll, így a tanítás a hidegindítás okozta veszteségugrás nélkül f
 | `germen train` | a nulláról tanít (`--data FÁJL` vagy `--demo`), vagy a `--resume` kapcsolóval folytatja |
 | `germen generate` | szöveget generál egy betanított modellből, kulcs–érték gyorsítótárral (`--temperature`, `--top-k`, `--prompt`) |
 
-Érdemes ismerni ezeket a tanítási kapcsolókat: `--tokenizer byte|bpe` és `--vocab N` (a BPE
-mérete); `--batch` és `--accum` (gradiens-felhalmozás: a tényleges köteg a kettő szorzata, a
-memória csak a `--batch`-é); `--grad-clip` (a gradiens globális normája, alapértelmezés 1); `--lr`,
+Érdemes ismerni ezeket a tanítási kapcsolókat: `--tokenizer byte|bpe` és `--vocab N` (a BPE mérete);
+`--batch` és `--accum` (gradiens-felhalmozás: a tényleges köteg a kettő szorzata, a memória csak a
+`--batch`-é); `--replicas N` (a modell másolatai, amelyek a szálak között osztják szét az egyes
+mikro-kötegeket; 0 = automatikus, 1 = ki; olyan `--batch`-et válassz, amely legalább a szálak
+számával egyenlő); `--grad-clip` (a gradiens globális normája, alapértelmezés 1); `--lr`,
 `--warmup`, `--weight-decay`. A `germen train --help` mindet felsorolja. Bármelyik parancshoz
 hozzáadhatod a `--threads N` kapcsolót a dolgozó szálak számának korlátozására (alapértelmezés:
 minden logikai processzor). A parancssor üzenetei egyelőre csak románul vannak.
@@ -91,24 +93,26 @@ A tanítás költsége nagyjából **6 × paraméterek × tokenek** lebegőponto
 szöveg = 1 millió token). Oszd el azzal, amit a processzorod valójában nyújt, és megvan az idő. A
 `germen bench` pontosan ezt méri a te gépeden.
 
-Referenciamérés – egy kis, **2 magos** (AVX-512) Linux virtuális gép, köteg 16 × 256, bájtszókincs
-(egyetlen futás egy zajos virtuális gépen, tehát ± 5 %):
+Referenciamérés – egy kis, **2 magos** (AVX-512) Linux virtuális gép, köteg 16 × 256, bájtszókincs,
+alapbeállítások (öt, egymást váltogató futás mediánja egy zajos virtuális gépen, tehát ± 10 %):
 
 | név | token/s | tényleges GFLOPS | 100 M token | 1 Mrd token |
 |---|---:|---:|---:|---:|
-| `nano` | 8 261 | 54 | 3,4 óra | 1,4 nap |
-| `micro` | 3 180 | 63 | 8,7 óra | 3,6 nap |
-| `mini` | 1 260 | 90 | 22,0 óra | 9,2 nap |
-| `small` | 545 | 90 | 2,1 nap | 21 nap |
+| `nano` | 8 366 | 54 | 3,3 óra | 1,4 nap |
+| `micro` | 3 981 | 79 | 7,0 óra | 2,9 nap |
+| `mini` | 1 464 | 104 | 19,0 óra | 7,9 nap |
+| `small` | 647 | 106 | 1,8 nap | 18 nap |
 
-Az 1-ről 2 szálra váltás itt 1,51-szeresére gyorsította a `mini`-t (825 → 1 247 token/s), ezért ne
-várd, hogy 20 mag 20-szoros gyorsulást ad. A mátrixszorzatok jól skálázódnak (≈ 1,8× két szálon); a
-figyelem kevésbé (≈ 1,2×), az RMSNorm, a forgó beágyazások és az AdamW-frissítés pedig alig, így
-sok magos gépen ezek válnak szűk keresztmetszetté (Amdahl törvénye). Erre való a
-`germen bench --scaling`: kiírja a teljes görbét és azt a szálszámot, amely felett már semmit sem
-nyerünk. **Futtasd le a `germen bench --scaling --json bench.json` parancsot a saját gépeden** –
-csak így derül ki. A számításra optimális tanítás egyik gyakorlati szabálya körülbelül 20 token
-paraméterenként; a kis modelleket gyakran sokkal többön tanítják.
+Az 1-ről 2 szálra váltás itt 2,04-szeresére gyorsította a `mini`-t (733 → 1 494 token/s; `--replicas
+1` mellett 1,41-szeresére), ezért ne várd, hogy 20 mag 20-szoros gyorsulást ad. Egyetlen gráfon
+belül a mátrixszorzatok jól skálázódnak (≈ 1,8× két szálon), a figyelem kevésbé (≈ 1,2×), az
+RMSNorm, a forgó beágyazások és az AdamW-frissítés pedig alig; a 0.3-as verzió replikái ezeket a
+részeket egymás mellett futtatják, de ehhez legalább annyi ablak kell kötegenként, ahány szál van.
+Hogy ez sok magon meddig visz, azt még nem mértük: erre való a `germen bench --scaling`, amely
+kiírja a teljes görbét és azt a szálszámot, amely felett már semmit sem nyerünk. **Futtasd le a
+`germen bench --scaling --json bench.json` parancsot a saját gépeden** – csak így derül ki. A
+számításra optimális tanítás egyik gyakorlati szabálya körülbelül 20 token paraméterenként; a kis
+modelleket gyakran sokkal többön tanítják.
 
 A generálás kulcs–érték gyorsítótárat használ: 400 token a `mini` modellel nagyjából 1 másodperc
 15 helyett, ugyanazon a két magon.
@@ -139,30 +143,41 @@ crates/germen-cli    a `germen` parancssor (clap)
   bit/bájt egységben), atomi ellenőrzőpontok, előrehaladás eseményeken (`Event`) keresztül, hogy
   egy grafikus felület ugyanazt a ciklust újra felhasználhassa.
 * **Szálak** — a teljes parancs egy saját szálkészlet dolgozójaként fut, amely a párhuzamos
-  ciklusokat szálak közötti átadás nélkül indítja (+ 7 % a `mini`-nél, akár + 25 % a `nano`-nál,
-  két magon). A mikro-kötegek elosztását több, mind a Burnt hajtó szál között kipróbáltuk és
-  elvetettük; lásd a [docs/PLAN.md](docs/PLAN.md) fájlt.
+  ciklusokat szálak közötti átadás nélkül indítja (+ 7 % a `mini`-nél, akár + 25 % a `nano`-nál, két
+  magon). Ezenfelül minden mikro-köteg **adatpárhuzamos replikákra** oszlik: a modell másolatai,
+  mindegyik saját automatikus differenciálási gráffal, különböző szálakon futtatják az előre- és a
+  visszafelé menetet, a gradiensek pedig rögzített sorrendben adódnak össze, így egy futás adott
+  szál- és replikaszám mellett reprodukálható (+ 23 % és + 44 % között két magon, a modelltől
+  függően, alacsonyabb memóriacsúccsal; a `--replicas 1` a hagyományos lépést adja). A mikro-kötegek
+  elosztását olyan szálak között, amelyek mind ugyanazt az egyetlen gráfot használták, a 0.2-ben
+  kipróbáltuk és elvetettük; lásd a [docs/PLAN.md](docs/PLAN.md) fájlt.
 * **Ellenőrzőpont** — egy mappa `config.json`, `weights.bpk` (a Burn burnpack formátuma, f32),
   `optimizer.bpk` (az AdamW momentumai), `tokenizer.json` és `meta.json` fájlokkal. A 0.1-es
   verzió által írt ellenőrzőpontok továbbra is betölthetők.
-* **Tesztek** — 70 egységteszt, köztük: a figyelem oksági, a blokkos figyelem megegyezik a Burnéval
-  (értékek és gradiensek), a gyorsítótáras generálás megegyezik a teljes átfutással, a
-  felhalmozott mikro-kötegek egyenértékűek egy nagy köteggel, egy optimalizálási lépés az AdamW
-  állapotának újratöltése után megegyezik a megszakítatlan tanítás lépésével, minden bájtsorozat
-  átvészeli az oda-vissza utat a BPE-n.
+* **Tesztek** — 117 teszt (a könyvtár és a parancssor egységtesztjei, valamint a valódi bináris
+  teljes futtatásai), köztük: a figyelem oksági, a blokkos figyelem megegyezik a Burnéval (értékek
+  és gradiensek), a gyorsítótáras generálás megegyezik a teljes átfutással, a felhalmozott
+  mikro-kötegek egyenértékűek egy nagy köteggel, a replikák egyetlen nagy gráf gradienseit adják és
+  egy futás bitre pontosan reprodukálható, egy optimalizálási lépés az AdamW állapotának újratöltése
+  után megegyezik a megszakítatlan tanítás lépésével, egy ellenőrzőpont sosem marad félig megírva és
+  nem véges súlyokat sosem mentünk, az ellenséges tokenizer- és konfigurációs fájlok elutasításra
+  kerülnek, minden bájtsorozat átvészeli az oda-vissza utat a BPE-n. Az ellenséges szemléletű
+  auditról a [docs/AUDIT.md](docs/AUDIT.md) szól.
 
-## Korlátok (0.2-es verzió)
+## Korlátok (0.3-as verzió)
 
 * A teljes korpusz beolvasásra kerül a memóriába (16 bites azonosítókként); a RAM-nál nagyobb,
   memóriába leképezett korpuszok tervben vannak.
-* A lépés néhány művelete (RMSNorm, forgó beágyazások, AdamW-frissítés) még nem használja jól a
-  további magokat; ezek párhuzamosítása a fő nyitott teljesítménykérdés.
+* Egyetlen gráfon belül a lépés néhány művelete (RMSNorm, forgó beágyazások, AdamW-frissítés) nem
+  használja jól a további magokat; a replikák ezt elfedik, ha a `--batch` legalább a szálak számával
+  egyenlő, de hogy ez sok magon meddig visz, azt még nem mértük.
 * Nincs vegyes pontosság és nincs GPU-háttérrendszer.
 * A `demo` korpusz szintetikus és parányi: azt bizonyítja, hogy a lánc tanul, többet nem.
 * Még nincs lemérve Windowson, macOS-en vagy sok magos gépen – fent leírtuk, hogyan segíthetsz.
 
-Lásd a [CHANGELOG.md](CHANGELOG.md) és a [docs/PLAN.md](docs/PLAN.md) fájlt. A hozzájárulásokat
-szívesen fogadjuk ([CONTRIBUTING.md](CONTRIBUTING.md)).
+Lásd a [CHANGELOG.md](CHANGELOG.md), a [docs/PLAN.md](docs/PLAN.md) és a
+[docs/AUDIT.md](docs/AUDIT.md) fájlt. A hozzájárulásokat szívesen fogadjuk
+([CONTRIBUTING.md](CONTRIBUTING.md)).
 
 ## Licenc
 

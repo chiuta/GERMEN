@@ -191,7 +191,17 @@ impl Bpe {
                     a.max(b)
                 ));
             }
-            let mut bytes = tokens[a as usize].clone();
+            // Training never builds a token longer than a pre-token, and a file that asks for one
+            // is corrupt or hostile: each merge may double the longest token, so a few hundred
+            // bytes of JSON could otherwise demand terabytes. Check the length before copying.
+            let len = tokens[a as usize].len() + tokens[b as usize].len();
+            if len > MAX_PRETOKEN {
+                return Err(format!(
+                    "îmbinarea {k} ar produce un token de {len} octeți; maximul este {MAX_PRETOKEN}"
+                ));
+            }
+            let mut bytes = Vec::with_capacity(len);
+            bytes.extend_from_slice(&tokens[a as usize]);
             bytes.extend_from_slice(&tokens[b as usize]);
             tokens.push(bytes);
             if ranks
@@ -526,6 +536,24 @@ mod tests {
         let bpe = Bpe::train(b"ab ab ab ab", 300, &mut |_, _| {}).unwrap();
         assert!(bpe.vocab_size() >= 257);
         assert_eq!(bpe.encode(b"ab").len(), 1, "\"ab\" became a single token");
+    }
+
+    #[test]
+    fn hostile_merge_lists_cannot_exhaust_memory() {
+        // Every merge below doubles the longest token, so 60 of them would ask for an exabyte
+        // from a file of a few hundred bytes. A vocabulary must be refused before it is built.
+        let mut doubling: Vec<(TokenId, TokenId)> = vec![(97, 97)];
+        doubling.extend((0..60).map(|k| (256 + k, 256 + k)));
+        let err = Bpe::from_merges(doubling).unwrap_err();
+        assert!(err.contains("octeți"), "{err}");
+
+        // 64 bytes is the longest token that training can produce; it must still load.
+        let mut at_limit: Vec<(TokenId, TokenId)> = vec![(97, 97)]; // 2 bytes
+        at_limit.extend((0..5).map(|k| (256 + k, 256 + k))); // 4, 8, 16, 32 and 64 bytes
+        let bpe = Bpe::from_merges(at_limit.clone()).unwrap();
+        assert_eq!(bpe.token_bytes(261).len(), 64);
+        at_limit.push((261, 261)); // 128 bytes
+        assert!(Bpe::from_merges(at_limit).is_err());
     }
 
     #[test]

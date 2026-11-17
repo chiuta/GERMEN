@@ -66,7 +66,9 @@ Kaltstarts weitergeht (die Textfenster werden neu gezogen).
 
 Wissenswerte Trainingsoptionen: `--tokenizer byte|bpe` und `--vocab N` (die BPE-Größe); `--batch`
 und `--accum` (Gradientenakkumulation: Der effektive Batch ist ihr Produkt, der Speicher entspricht
-dem von `--batch` allein); `--grad-clip` (globale Gradientennorm, Standard 1); `--lr`, `--warmup`,
+dem von `--batch` allein); `--replicas N` (Kopien des Modells, die sich jeden Mikro-Batch auf die
+Threads aufteilen; 0 = automatisch, 1 = aus; wählen Sie einen `--batch`, der mindestens so groß ist
+wie die Zahl der Threads); `--grad-clip` (globale Gradientennorm, Standard 1); `--lr`, `--warmup`,
 `--weight-decay`. `germen train --help` listet alle auf. Fügen Sie `--threads N` zu jedem Befehl
 hinzu, um die Zahl der Arbeits-Threads zu begrenzen (Standard: alle logischen Prozessoren). Die
 Meldungen der Kommandozeile sind vorerst nur auf Rumänisch.
@@ -92,25 +94,27 @@ Die Trainingskosten betragen etwa **6 × Parameter × Token** Gleitkommaoperatio
 1 MB Text = 1 Million Token). Teilen Sie durch das, was Ihre CPU tatsächlich leistet, und Sie
 haben die Zeit. `germen bench` misst genau das auf Ihrem Rechner.
 
-Referenzmessung – eine kleine Linux-VM mit **2 Kernen** (AVX-512), Batch 16 × 256, Byte-Vokabular
-(ein einziger Lauf auf einer verrauschten VM, daher ± 5 %):
+Referenzmessung – eine kleine Linux-VM mit **2 Kernen** (AVX-512), Batch 16 × 256, Byte-Vokabular,
+Standardeinstellungen (Median aus fünf abwechselnd ausgeführten Läufen auf einer verrauschten VM,
+daher ± 10 %):
 
 | Name | Token/s | effektive GFLOPS | 100 Mio. Token | 1 Mrd. Token |
 |---|---:|---:|---:|---:|
-| `nano` | 8.261 | 54 | 3,4 Std. | 1,4 Tage |
-| `micro` | 3.180 | 63 | 8,7 Std. | 3,6 Tage |
-| `mini` | 1.260 | 90 | 22,0 Std. | 9,2 Tage |
-| `small` | 545 | 90 | 2,1 Tage | 21 Tage |
+| `nano` | 8.366 | 54 | 3,3 Std. | 1,4 Tage |
+| `micro` | 3.981 | 79 | 7,0 Std. | 2,9 Tage |
+| `mini` | 1.464 | 104 | 19,0 Std. | 7,9 Tage |
+| `small` | 647 | 106 | 1,8 Tage | 18 Tage |
 
-Der Wechsel von 1 auf 2 Threads machte `mini` hier 1,51× schneller (825 → 1.247 Token/s);
-erwarten Sie also nicht, dass 20 Kerne das 20-Fache bringen. Matrixprodukte skalieren gut
-(≈ 1,8× auf zwei Threads); die Attention weniger (≈ 1,2×), und RMSNorm, rotierende Embeddings und
-das AdamW-Update kaum, sodass sie auf einem Rechner mit vielen Kernen zum Engpass werden
-(Amdahlsches Gesetz). Dafür gibt es `germen bench --scaling`: Es gibt die ganze Kurve aus und die
-Thread-Zahl, ab der nichts mehr gewonnen wird. **Führen Sie `germen bench --scaling --json
-bench.json` auf Ihrem Rechner aus** – nur so lässt es sich wissen. Eine Faustregel für
-rechenoptimales Training sind etwa 20 Token pro Parameter; kleine Modelle werden oft mit sehr viel
-mehr trainiert.
+Der Wechsel von 1 auf 2 Threads machte `mini` hier 2,04× schneller (733 → 1.494 Token/s; 1,41× mit
+`--replicas 1`); erwarten Sie also nicht, dass 20 Kerne das 20-Fache bringen. In einem einzelnen
+Graphen skalieren Matrixprodukte gut (≈ 1,8× auf zwei Threads), die Attention weniger (≈ 1,2×), und
+RMSNorm, rotierende Embeddings und das AdamW-Update kaum; die Replikate der Version 0.3 führen diese
+Teile nebeneinander aus, brauchen dafür aber mindestens so viele Fenster pro Batch wie Threads. Wie
+weit das auf vielen Kernen trägt, ist noch nicht gemessen: Dafür gibt es `germen bench --scaling`,
+das die ganze Kurve ausgibt und die Thread-Zahl, ab der nichts mehr gewonnen wird. **Führen Sie
+`germen bench --scaling --json bench.json` auf Ihrem Rechner aus** – nur so lässt es sich wissen.
+Eine Faustregel für rechenoptimales Training sind etwa 20 Token pro Parameter; kleine Modelle werden
+oft mit sehr viel mehr trainiert.
 
 Die Generierung nutzt einen Key-Value-Cache: 400 Token mit `mini` dauern etwa 1 Sekunde statt 15
 auf denselben zwei Kernen.
@@ -141,31 +145,42 @@ crates/germen-cli    die Kommandozeile `germen` (clap)
   pro Byte), atomare Checkpoints, Fortschritt über Ereignisse (`Event`), damit eine grafische
   Oberfläche dieselbe Schleife wiederverwenden kann.
 * **Threads** — der ganze Befehl läuft als Arbeiter eines eigenen Thread-Pools, der parallele
-  Schleifen ohne Übergabe zwischen Threads startet (+ 7 % bei `mini`, bis zu + 25 % bei `nano`,
-  auf zwei Kernen). Mikro-Batches auf mehrere Threads zu verteilen, die alle Burn ansteuern, wurde
-  versucht und verworfen; siehe [docs/PLAN.md](docs/PLAN.md).
+  Schleifen ohne Übergabe zwischen Threads startet (+ 7 % bei `mini`, bis zu + 25 % bei `nano`, auf
+  zwei Kernen). Zusätzlich wird jeder Mikro-Batch in **datenparallele Replikate** aufgeteilt: Kopien
+  des Modells, jede mit einem eigenen Autodiff-Graphen, laufen vorwärts und rückwärts auf
+  verschiedenen Threads, und ihre Gradienten werden in fester Reihenfolge addiert, sodass ein Lauf
+  für eine gegebene Zahl von Threads und Replikaten reproduzierbar ist (+ 23 % bis + 44 % auf zwei
+  Kernen, je nach Modell, bei niedrigerem Speicherspitzenwert; `--replicas 1` ergibt den
+  gewöhnlichen Schritt). Mikro-Batches auf Threads zu verteilen, die alle einen einzigen Graphen
+  teilten, wurde in 0.2 versucht und verworfen; siehe [docs/PLAN.md](docs/PLAN.md).
 * **Checkpoint** — ein Ordner mit `config.json`, `weights.bpk` (Burns Burnpack-Format, f32),
   `optimizer.bpk` (die AdamW-Momente), `tokenizer.json` und `meta.json`. Von Version 0.1
   geschriebene Checkpoints lassen sich weiterhin laden.
-* **Tests** — 70 Unit-Tests, darunter: Die Attention ist kausal, die blockweise Attention gleicht
+* **Tests** — 117 Tests (Unit-Tests der Bibliothek und der Kommandozeile sowie vollständige Läufe
+  des echten Binärprogramms), darunter: Die Attention ist kausal, die blockweise Attention gleicht
   der von Burn (Werte und Gradienten), die Generierung mit Cache gleicht dem vollständigen
-  Durchlauf, akkumulierte Mikro-Batches entsprechen einem großen Batch, ein Optimierungsschritt
-  nach dem Neuladen des AdamW-Zustands gleicht dem eines ununterbrochenen Trainings, jede Bytefolge
-  übersteht den Hin-und-Rück-Weg durch das BPE.
+  Durchlauf, akkumulierte Mikro-Batches entsprechen einem großen Batch, Replikate liefern die
+  Gradienten eines einzigen großen Graphen und ein Lauf ist bitgenau reproduzierbar, ein
+  Optimierungsschritt nach dem Neuladen des AdamW-Zustands gleicht dem eines ununterbrochenen
+  Trainings, ein Checkpoint bleibt nie halb geschrieben und nicht endliche Gewichte werden nie
+  gespeichert, feindliche Tokenizer- und Konfigurationsdateien werden abgelehnt, jede Bytefolge
+  übersteht den Hin-und-Rück-Weg durch das BPE. Das adversariale Audit steht in
+  [docs/AUDIT.md](docs/AUDIT.md).
 
-## Grenzen (Version 0.2)
+## Grenzen (Version 0.3)
 
 * Der gesamte Korpus wird in den Speicher gelesen (als 16-Bit-Kennungen); speicherabgebildete
   Korpora, die größer als der Arbeitsspeicher sind, sind geplant.
-* Einige Operationen des Schritts (RMSNorm, rotierende Embeddings, AdamW-Update) nutzen zusätzliche
-  Kerne noch nicht gut; sie zu parallelisieren ist der wichtigste offene Leistungspunkt.
+* In einem einzelnen Graphen nutzen einige Operationen des Schritts (RMSNorm, rotierende Embeddings,
+  AdamW-Update) zusätzliche Kerne nicht gut; Replikate verbergen das, wenn `--batch` mindestens der
+  Thread-Zahl entspricht, wie weit das auf vielen Kernen trägt, ist aber noch nicht gemessen.
 * Keine gemischte Präzision und kein GPU-Backend.
 * Der `demo`-Korpus ist synthetisch und winzig: Er beweist, dass die Kette lernt, mehr nicht.
 * Noch nicht gemessen unter Windows, macOS oder auf einem Rechner mit vielen Kernen – oben steht,
   wie Sie helfen können.
 
-Siehe [CHANGELOG.md](CHANGELOG.md) und [docs/PLAN.md](docs/PLAN.md). Beiträge sind willkommen
-([CONTRIBUTING.md](CONTRIBUTING.md)).
+Siehe [CHANGELOG.md](CHANGELOG.md), [docs/PLAN.md](docs/PLAN.md) und [docs/AUDIT.md](docs/AUDIT.md).
+Beiträge sind willkommen ([CONTRIBUTING.md](CONTRIBUTING.md)).
 
 ## Lizenz
 

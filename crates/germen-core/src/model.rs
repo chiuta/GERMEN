@@ -9,6 +9,7 @@ use burn::prelude::*;
 use burn::tensor::activation::{relu, softmax};
 use burn::tensor::module::attention;
 use burn::tensor::ops::AttentionModuleOptions;
+use std::sync::{Mutex, PoisonError};
 
 /// Standard deviation of the weight initialisation (GPT-2 convention).
 const INIT_STD: f64 = 0.02;
@@ -309,8 +310,29 @@ pub struct Gpt {
     block_size: usize,
 }
 
+/// Burn keeps ONE random generator per device, shared by every thread of the process, and each
+/// initial weight is a draw from it. Seeding it and drawing the weights therefore has to be one
+/// uninterrupted step: two threads doing it at once (two training runs in one process, or two
+/// tests) would each take a share of the other's stream, and neither would get the weights its seed
+/// promises. This lock makes the step uninterrupted; everything in GERMEN that draws goes through
+/// [`exclusive_generator`].
+static GENERATOR: Mutex<()> = Mutex::new(());
+
+/// Runs `f` while no other thread of this crate seeds or draws from the device generator.
+pub(crate) fn exclusive_generator<R>(f: impl FnOnce() -> R) -> R {
+    // The guard protects no data, so a panic in another holder leaves nothing to distrust.
+    let _turn = GENERATOR.lock().unwrap_or_else(PoisonError::into_inner);
+    f()
+}
+
 impl GptConfig {
-    /// Builds a freshly initialised model on `device`.
+    /// Builds a freshly initialised model on `device`, whose weights are drawn from the device's
+    /// random generator the first time something reads them.
+    ///
+    /// That is the right constructor for a model that is about to be overwritten from a
+    /// checkpoint (nothing is drawn for it), and the wrong one for a model that is going to be
+    /// trained: its weights would depend on when, and on which thread, they are first touched. Use
+    /// [`GptConfig::init_seeded`] for that.
     ///
     /// Panics if the configuration is invalid; call [`GptConfig::validate`] first for a
     /// recoverable error.
@@ -356,9 +378,54 @@ impl GptConfig {
             block_size: self.block_size,
         }
     }
+
+    /// Builds a model on `device` whose initial weights depend on `seed` alone.
+    ///
+    /// Seeds the device's generator and draws every weight, in a fixed order, as one step that no
+    /// other thread can interleave with (see [`GptConfig::init`] for why that matters), so two
+    /// runs started at the same moment from different threads still get the weights of their own
+    /// seeds, and the same seed always gives the same model.
+    ///
+    /// Panics if the configuration is invalid.
+    pub fn init_seeded(&self, device: &Device, seed: u64) -> Gpt {
+        exclusive_generator(|| {
+            device.seed(seed);
+            let model = self.init(device);
+            model.draw_all_parameters();
+            model
+        })
+    }
+}
+
+/// Reads every parameter once, which is what draws its initial value.
+struct InitAll;
+
+impl burn::module::ModuleVisitor for InitAll {
+    fn visit_float<const D: usize>(&mut self, param: &burn::module::Param<Tensor<D>>) {
+        let _ = param.val();
+    }
 }
 
 impl Gpt {
+    /// Draws the initial value of every parameter now, in a fixed order.
+    ///
+    /// Burn initialises a parameter the first time something reads it, and each draw advances
+    /// the device's random generator. When several threads touch a fresh model at once (the
+    /// data-parallel training step does), the order of the draws, and with it every initial
+    /// weight, would depend on thread timing. Calling this first fixes the order; seeding the
+    /// device first, under the same lock, is what [`GptConfig::init_seeded`] does, and is usually
+    /// what you want. A model that is about to be loaded from a file must not call it: that would
+    /// waste the draws.
+    pub fn init_parameters(&self) {
+        exclusive_generator(|| self.draw_all_parameters());
+    }
+
+    /// [`Gpt::init_parameters`] for a caller that already holds the generator.
+    fn draw_all_parameters(&self) {
+        use burn::module::Module;
+        self.visit(&mut InitAll);
+    }
+
     /// Maximum context length this model was built for.
     pub fn block_size(&self) -> usize {
         self.block_size
@@ -467,7 +534,7 @@ mod tests {
         let device = Device::flex();
         for p in [Preset::Nano, Preset::Micro] {
             let cfg = p.config(32);
-            let model = cfg.init(&device);
+            let model = cfg.init_seeded(&device, 1);
             assert_eq!(model.num_params(), cfg.num_params(), "{}", p.name());
         }
     }
@@ -476,7 +543,7 @@ mod tests {
     fn cached_forward_reproduces_the_full_forward_pass() {
         let device = Device::flex();
         let cfg = Preset::Nano.config(40);
-        let model = cfg.init(&device);
+        let model = cfg.init_seeded(&device, 1);
         let t = 30;
         let all = tokens(1, t, &device, |_, c| ((c * 37 + 11) % 256) as i32);
         let full: Vec<f32> = model.forward(all.clone()).into_data().try_to_vec().unwrap();
@@ -516,7 +583,7 @@ mod tests {
     #[should_panic(expected = "exceeds block_size")]
     fn cached_forward_refuses_to_outgrow_the_context() {
         let device = Device::flex();
-        let model = Preset::Nano.config(8).init(&device);
+        let model = Preset::Nano.config(8).init_seeded(&device, 1);
         let mut cache = model.new_cache();
         let x = tokens(1, 6, &device, |_, c| c as i32);
         model.forward_cached(x.clone(), &mut cache);
@@ -535,7 +602,7 @@ mod tests {
     fn parameter_count_follows_a_larger_vocabulary() {
         let device = Device::flex();
         let cfg = Preset::Nano.config(32).with_vocab(1000);
-        let model = cfg.init(&device);
+        let model = cfg.init_seeded(&device, 1);
         assert_eq!(model.num_params(), cfg.num_params());
         assert_eq!(
             cfg.num_params() - Preset::Nano.config(32).num_params(),
@@ -550,7 +617,7 @@ mod tests {
     fn forward_has_expected_shape_and_is_finite() {
         let device = Device::flex();
         let cfg = Preset::Nano.config(32);
-        let model = cfg.init(&device);
+        let model = cfg.init_seeded(&device, 1);
         let x = tokens(3, 20, &device, |r, c| ((r * 31 + c * 7) % 256) as i32);
         let logits = model.forward(x);
         assert_eq!(logits.dims(), [3, 20, 256]);
@@ -563,7 +630,7 @@ mod tests {
         // Changing a token must not affect the logits of EARLIER positions.
         let device = Device::flex();
         let cfg = Preset::Nano.config(32);
-        let model = cfg.init(&device);
+        let model = cfg.init_seeded(&device, 1);
         let a = tokens(1, 16, &device, |_, c| (c * 13 % 256) as i32);
         let b = tokens(1, 16, &device, |_, c| {
             if c >= 10 { 200 } else { (c * 13 % 256) as i32 }
@@ -607,9 +674,11 @@ mod tests {
         let device = Device::flex().autodiff();
         let (b, h, t, hd) = (2usize, 3usize, 20usize, 8usize);
         let dist = Distribution::Normal(0.0, 1.0);
-        let q = Tensor::<4>::random([b, h, t, hd], dist, &device).require_grad();
-        let k = Tensor::<4>::random([b, h, t, hd], dist, &device).require_grad();
-        let v = Tensor::<4>::random([b, h, t, hd], dist, &device).require_grad();
+        // Draws from the generator that every thread of the process shares: one at a time.
+        let (q, k, v) = exclusive_generator(|| {
+            let draw = || Tensor::<4>::random([b, h, t, hd], dist, &device).require_grad();
+            (draw(), draw(), draw())
+        });
         let mask = Tensor::<2>::from_data(TensorData::new(causal_mask_values(t), [t, t]), &device)
             .reshape([1, 1, t, t]);
 
@@ -651,7 +720,7 @@ mod tests {
         // The autodiff device uses the block attention, the plain device Burn's fused kernel.
         let train_dev = Device::flex().autodiff();
         let cfg = Preset::Nano.config(300); // longer than the attention block (64): several blocks
-        let model = cfg.init(&train_dev);
+        let model = cfg.init_seeded(&train_dev, 1);
         let x = tokens(2, 300, &train_dev, |r, c| ((r * 29 + c * 3) % 256) as i32);
         let a = model.forward(x.clone());
 
@@ -661,10 +730,67 @@ mod tests {
         assert!(max_diff(a.inner(), b) < 1e-3);
     }
 
+    /// Every parameter of a model, in the module's own order.
+    fn weights(model: &Gpt) -> Vec<f32> {
+        struct Collect(Vec<f32>);
+        impl burn::module::ModuleVisitor for Collect {
+            fn visit_float<const D: usize>(&mut self, param: &burn::module::Param<Tensor<D>>) {
+                self.0
+                    .extend(param.val().into_data().try_to_vec::<f32>().unwrap());
+            }
+        }
+        let mut all = Collect(Vec::new());
+        burn::module::Module::visit(model, &mut all);
+        all.0
+    }
+
+    #[test]
+    fn the_seed_alone_decides_the_weights_even_when_other_threads_draw() {
+        // Burn has one random generator for the whole process. Eight threads build models at once,
+        // four with one seed and four with another, round after round; whatever the interleaving,
+        // every model must be the one its seed promises. Without the lock around "seed, then
+        // draw" the threads take shares of each other's streams.
+        let (cfg, device) = (Preset::Nano.config(16), Device::flex());
+        let alone = |seed| weights(&cfg.init_seeded(&device, seed));
+        let (want_a, want_b) = (alone(11), alone(22));
+        assert_ne!(
+            want_a, want_b,
+            "different seeds must give different weights"
+        );
+        assert_eq!(
+            want_a,
+            alone(11),
+            "the same seed must give the same weights"
+        );
+
+        std::thread::scope(|scope| {
+            let threads: Vec<_> = (0..8usize)
+                .map(|i| {
+                    let (cfg, device) = (&cfg, &device);
+                    scope.spawn(move || {
+                        let seed = if i % 2 == 0 { 11 } else { 22 };
+                        (0..12)
+                            .map(|_| weights(&cfg.init_seeded(device, seed)))
+                            .collect::<Vec<_>>()
+                    })
+                })
+                .collect();
+            for (i, thread) in threads.into_iter().enumerate() {
+                let want = if i % 2 == 0 { &want_a } else { &want_b };
+                for (round, got) in thread.join().unwrap().iter().enumerate() {
+                    assert!(
+                        got == want,
+                        "thread {i}, round {round}: not the seed's weights"
+                    );
+                }
+            }
+        });
+    }
+
     #[test]
     fn initial_loss_is_close_to_uniform_entropy() {
         let device = Device::flex();
-        let model = Preset::Nano.config(32).init(&device);
+        let model = Preset::Nano.config(32).init_seeded(&device, 1);
         let x = tokens(4, 24, &device, |r, c| ((r * 17 + c * 5) % 256) as i32);
         let y = tokens(4, 24, &device, |r, c| ((r * 3 + c * 11 + 1) % 256) as i32);
         let loss = model.loss(x, y).into_scalar::<f32>();

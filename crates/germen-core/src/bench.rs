@@ -7,8 +7,9 @@
 use crate::config::GptConfig;
 use crate::data::{Batch, Rng};
 use crate::sys;
+use crate::train::{micro_batch_gradients, plan_replicas};
 use burn::grad_clipping::GradientClippingConfig;
-use burn::optim::{AdamWConfig, GradientsParams};
+use burn::optim::AdamWConfig;
 use serde::Serialize;
 use std::fmt::Write as _;
 use std::time::Instant;
@@ -30,6 +31,8 @@ pub struct BenchResult {
     pub ms_per_step: f64,
     /// Fastest step in milliseconds.
     pub ms_per_step_best: f64,
+    /// Data-parallel replicas the step ran as (1 = the ordinary single-graph step).
+    pub replicas: usize,
     /// Training throughput (tokens per second).
     pub tokens_per_sec: f64,
     /// Effective speed in GFLOPS, counting only the model's own matrix multiplications
@@ -79,6 +82,8 @@ pub struct BenchParams {
     pub warmup: usize,
     /// Timed steps.
     pub steps: usize,
+    /// Data-parallel replicas per step (`0` = automatic, see `train::plan_replicas`).
+    pub replicas: usize,
 }
 
 /// One measurement of a thread-count sweep.
@@ -221,10 +226,11 @@ impl BenchReport {
             let _ = writeln!(s);
             let _ = writeln!(
                 s,
-                "{:<7} {:>9} {:>11} {:>9} {:>10} {:>8} {:>10} {:>13} {:>13}",
+                "{:<7} {:>9} {:>11} {:>8} {:>9} {:>10} {:>8} {:>10} {:>13} {:>13}",
                 "model",
                 "parametri",
                 "lot×context",
+                "replici",
                 "ms/pas",
                 "tokeni/s",
                 "GFLOPS",
@@ -238,10 +244,11 @@ impl BenchReport {
                     .map_or("—".to_string(), |m| format!("{:.0} MiB", m));
                 let _ = writeln!(
                     s,
-                    "{:<7} {:>8.2}M {:>11} {:>9.0} {:>10.0} {:>8.1} {:>10} {:>13} {:>13}",
+                    "{:<7} {:>8.2}M {:>11} {:>8} {:>9.0} {:>10.0} {:>8.1} {:>10} {:>13} {:>13}",
                     r.preset,
                     r.params as f64 / 1e6,
                     format!("{}×{}", r.batch, r.seq),
+                    r.replicas,
                     r.ms_per_step,
                     r.tokens_per_sec,
                     r.gflops,
@@ -272,8 +279,9 @@ impl Default for BenchReport {
 
 /// Times `steps` full training steps of `cfg` (after `warmup` untimed ones).
 ///
-/// `name` only labels the result. Returns an error if the batch does not fit the context or the
-/// loss turns non-finite.
+/// `name` only labels the result. `replicas` is the number of data-parallel replicas per step
+/// (`0` = automatic, as in training). Returns an error if the batch does not fit the context or
+/// the loss turns non-finite.
 pub fn bench_model(
     name: &str,
     cfg: &GptConfig,
@@ -281,6 +289,7 @@ pub fn bench_model(
     seq: usize,
     warmup: usize,
     steps: usize,
+    replicas: usize,
 ) -> Result<BenchResult, String> {
     cfg.validate()?;
     if batch == 0 || steps == 0 {
@@ -293,11 +302,15 @@ pub fn bench_model(
         ));
     }
 
-    sys::check_memory_fits(cfg.estimate_train_bytes(batch, seq), batch, seq)?;
+    let replicas = plan_replicas(cfg, batch, seq, replicas);
+    sys::check_memory_fits(
+        cfg.estimate_train_bytes_replicated(batch, seq, replicas.min(sys::worker_threads())),
+        batch,
+        seq,
+    )?;
 
     let device = crate::train_device();
-    device.seed(1);
-    let mut model = cfg.init(&device);
+    let mut model = cfg.init_seeded(&device, 1);
     let mut optim = AdamWConfig::new()
         .with_beta_2(0.95)
         .with_epsilon(1e-8)
@@ -307,11 +320,10 @@ pub fn bench_model(
 
     let mut times = Vec::with_capacity(steps);
     for i in 0..warmup + steps {
-        let (x, y) = Batch::random(batch, seq, cfg.vocab_size, &mut rng).to_tensors(&device);
+        let window = Batch::random(batch, seq, cfg.vocab_size, &mut rng);
         let started = Instant::now();
-        let loss = model.loss(x, y);
-        let value = loss.clone().into_scalar::<f32>();
-        let grads = GradientsParams::from_grads(loss.backward(), &model);
+        let (grads, value) = micro_batch_gradients(&model, &window, replicas, 1, &device)
+            .map_err(|bad| format!("pierderea a devenit {bad} în benchmark"))?;
         model = optim.step(1e-4, model, grads);
         let dt = started.elapsed().as_secs_f64();
         if !value.is_finite() {
@@ -333,6 +345,7 @@ pub fn bench_model(
         steps,
         ms_per_step: mean * 1e3,
         ms_per_step_best: best * 1e3,
+        replicas,
         tokens_per_sec: tokens / mean,
         gflops: cfg.train_flops_per_token(seq) * tokens / mean / 1e9,
         peak_rss_mib: sys::peak_rss_mib(),
@@ -369,6 +382,7 @@ pub fn bench_scaling(
                 params.seq,
                 params.warmup,
                 params.steps,
+                params.replicas,
             )
         })?;
         let (base_speed, base_threads) = points.first().map_or((result.tokens_per_sec, n), |p| {
@@ -413,6 +427,7 @@ mod tests {
             seq: 16,
             warmup: 0,
             steps: 1,
+            replicas: 0,
         };
         let mut seen = Vec::new();
         let series =
@@ -448,18 +463,31 @@ mod tests {
     #[test]
     fn bench_runs_and_reports_sane_numbers() {
         let cfg = Preset::Nano.config(32);
-        let r = bench_model("nano", &cfg, 2, 16, 1, 2).unwrap();
+        let r = bench_model("nano", &cfg, 2, 16, 1, 2, 0).unwrap();
         assert_eq!(r.params, cfg.num_params());
         assert!(r.ms_per_step > 0.0 && r.tokens_per_sec > 0.0 && r.gflops > 0.0);
         assert!(r.ms_per_step_best <= r.ms_per_step + 1e-9);
         assert!((r.eta_secs(r.tokens_per_sec) - 1.0).abs() < 1e-9);
+        assert!(
+            (1..=2).contains(&r.replicas),
+            "never more replicas than windows"
+        );
+    }
+
+    #[test]
+    fn bench_can_force_the_ordinary_step_or_more_replicas_than_threads() {
+        let cfg = Preset::Nano.config(32);
+        let one = bench_model("nano", &cfg, 4, 16, 0, 1, 1).unwrap();
+        assert_eq!(one.replicas, 1);
+        let many = bench_model("nano", &cfg, 4, 16, 0, 1, 100).unwrap();
+        assert_eq!(many.replicas, 4, "capped at the number of windows");
     }
 
     #[test]
     fn bench_rejects_bad_arguments() {
         let cfg = Preset::Nano.config(32);
-        assert!(bench_model("x", &cfg, 2, 64, 0, 1).is_err());
-        assert!(bench_model("x", &cfg, 0, 16, 0, 1).is_err());
+        assert!(bench_model("x", &cfg, 2, 64, 0, 1, 0).is_err());
+        assert!(bench_model("x", &cfg, 0, 16, 0, 1, 0).is_err());
     }
 
     #[test]
@@ -467,7 +495,7 @@ mod tests {
         let cfg = Preset::Nano.config(32);
         let mut rep = BenchReport::new();
         rep.results
-            .push(bench_model("nano", &cfg, 2, 16, 0, 1).unwrap());
+            .push(bench_model("nano", &cfg, 2, 16, 0, 1, 0).unwrap());
         let text = rep.render();
         assert!(text.contains("nano") && text.contains("tokeni/s"));
         let json = rep.to_json();

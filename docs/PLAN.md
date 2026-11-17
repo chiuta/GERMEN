@@ -1,6 +1,6 @@
 # GERMEN — plan and decisions
 
-Status: version 0.2.0 (November 2026). The name is provisional; check it against trademark
+Status: version 0.3.0 (November 2026). The name is provisional; check it against trademark
 databases (EUIPO / TMview) before any public launch.
 
 ## 1. Goal
@@ -45,7 +45,8 @@ data, and to have a transparent, auditable base to build on.
 | gradient clipping | global norm over all parameters, default 1 | the standard recipe; Burn's built-in clipping works per tensor |
 | optimizer state | saved next to the weights (`optimizer.bpk`, keyed by parameter id) | resuming without it causes a loss bump; a test shows the step after a reload equals the uninterrupted one |
 | threads | the whole command runs inside its own rayon pool (`sys::run_in_pool`) | +7 % (`mini`) to +25 % (`nano`) on two cores compared with driving the global pool from an outside thread, because every parallel loop otherwise needs a hand-off between threads |
-| checkpoint | burnpack + JSON | native to Burn, atomic writes, no extra dependency |
+| data parallelism | the windows of a micro-batch are split among *replicas* of the model, each with its own autodiff graph (`Module::fork`), run forward and backward on different threads; gradients are added in a fixed pairwise order (`train::micro_batch_gradients`) | + 23 % (`nano`) to + 44 % (`micro`) on two cores (`mini` + 34 %, `small` + 36 %; ratios of the medians of five interleaved runs, ± 10 %), with a peak memory 1–3 % lower: the small element-wise operations that do not scale inside one graph now run side by side. A fixed slot scheme, a fixed reduction tree and a fixed order of drawing the initial weights make a run reproducible for a given number of threads and replicas; a test compares the gradients with those of one big graph |
+| checkpoint | burnpack + JSON; every file staged, fsynced and renamed together, `meta.json` last; a lock file per directory; non-finite weights are never written or loaded | a crash or a second run can no longer leave a mixed set of files, and a diverged model cannot replace a good checkpoint (see [AUDIT.md](AUDIT.md)) |
 | UI language | Romanian messages, English code and docs, READMEs in eight languages | first user is Romanian; moving the messages to a catalogue is a starter issue |
 
 ## 4. Performance findings (2-core AVX-512 VM, `mini`, batch 16 × 256)
@@ -68,17 +69,47 @@ By Amdahl's law the parts that do not scale decide what many cores can give, whi
 * **Done — run inside an own pool:** + 7 % (`mini`), + 17 % (`micro`), + 25 % (`nano`); `nano`
   went from about 5.5–6.1 k to 7.1–7.9 k tokens/s over three interleaved runs, which also shows
   how much of a small step was thread hand-offs.
-* **Rejected — data parallelism with several threads that each drive Burn** (each thread runs a
-  micro-batch forward and backward, gradients are summed): with four workers on a two-thread pool
-  the process deadlocked (every thread waiting in a futex, 0 % CPU), with two it gained 3.5 %. The
-  CPU backend is not meant to be driven by several threads at once while it also parallelises
-  inside each operation. Everything now runs on one driver thread.
+* **Done in 0.3 — data parallelism, with a graph per replica.** The attempt of 0.2 (several
+  threads each running a micro-batch forward and backward on the one model, gradients summed)
+  deadlocked with four workers on a two-thread pool (every thread waiting in a futex, 0 % CPU) and
+  gained 3.5 % with two: all threads shared a single autodiff graph and its lock. `Module::fork`
+  gives every replica a graph (and lock) of its own, which removed both problems. Final reference,
+  five interleaved rounds of the real `bench` against the ordinary step (`--replicas 1`), two
+  threads, batch 16 × 256, ratios of the medians: `nano` + 23 %, `micro` + 44 %, `mini` + 34 %,
+  `small` + 36 % (per-round ratios of `nano` ranged from + 2 % to + 40 %, so + 16 % by the median
+  of the rounds). An earlier series of the same kind gave + 25 / + 45 / + 23 / + 35 %; that `mini`
+  differs by eleven points between the two series is what ± 10 % looks like on this machine. Going
+  from one to two threads, `mini` became 2.04× faster (733 → 1,494 tokens/s) instead of 1.41×.
+  Peak memory with two replicas was 1–3 % lower than with the ordinary step in all four presets.
+  Reproducibility needed three things, each found by a test: a fixed reduction order (rayon's
+  `reduce` has no fixed tree), a fixed assignment of replicas to slots, and drawing the initial
+  weights in module order before any thread uses them (Burn initialises parameters lazily, on
+  first use, and every draw advances one device-wide generator). A test runs pools of one to five
+  threads with two to eight replicas under a watchdog. The full table and the control runs are in
+  [AUDIT.md](AUDIT.md).
 * **Not a lever — bigger batches:** a larger `--batch` did not raise tokens per second.
-* **Open — make the serial parts parallel.** In Flex 0.22.1 the element-wise SIMD kernels only
-  split work across threads for tensors of about 4 Mi elements or more (other operations use a
-  256 K-element threshold), so RMSNorm and rotary embeddings on the `mini` shapes stay on one
-  thread; `erf`/`tanh`/`exp` are single-threaded. Candidates: a parallel AdamW update over
-  parameter tensors, fused RMSNorm and rotary kernels, fewer tensor copies.
+* **Rejected by measurement in the 0.3 audit** (same virtual machine, interleaved runs, nothing
+  kept that did not win): allocator tuning of the C library and `mimalloc` (the latter was slower);
+  lowering Flex's thresholds for splitting element-wise work across threads; a bigger batch; a
+  parallel or fused AdamW update (the update is about 1.8 % of a step, so that is the most it could
+  give). Removing RMSNorm, rotary embeddings, the activation, the softmax or the mask altogether —
+  an upper bound for anything that speeds them up — saved less than 2–4 % of a step each and no more
+  than about 10 % together, so there is no cheap model-level win left in them. In Flex 0.22.1 the
+  element-wise SIMD kernels only split work across threads for tensors of about 4 Mi elements or
+  more (other operations use a 256 K-element threshold) and `erf`/`tanh`/`exp` are
+  single-threaded; replicas hide this when the batch has at least as many windows as there are
+  threads.
+* **Open — how many replicas?** The default is one replica per thread (at most one per window).
+  Forcing more replicas than threads, so that each replica is a single window, was measured at two
+  threads against that default: `nano` + 40 %, `micro` + 6 %, `mini` + 8 %, but `small` − 8 % (batch
+  16; four rounds, three for `small`), and for `nano` at batch 4 it was − 9 %; at one thread
+  `nano` and `mini` gained + 9 %. Smaller graphs stay in the caches, while every replica adds one
+  more gradient set to the sum, a cost that grows with the parameters; a parallel or in-place
+  reduction might remove it and has not been tried. Until then the default stays conservative and
+  `--replicas N` is the knob (table in [AUDIT.md](AUDIT.md)).
+* **Open — a many-core measurement.** Everything above comes from two cores. How far replicas carry
+  on 20 cores is unknown (`germen bench --scaling --json bench.json` will tell); at most `--batch`
+  replicas exist, so use a batch at least as large as the number of threads.
 
 `cargo run --release -p germen-core --example profile_ops -- N` times single operations with N
 threads; `profile_step`, `profile_mlp` and `profile_attn` do the same for a whole step and for the
@@ -88,12 +119,14 @@ feed-forward and attention blocks.
 
 * **0.2 (done)** — BPE tokenizer; AdamW state on `--resume`; global-norm clipping; key/value cache;
   gradient accumulation; `bench --scaling`; READMEs in eight languages.
-* **0.3** — parallel non-matmul parts of the step (driven by the first many-core measurement);
-  memory-mapped corpora larger than RAM.
-* **0.4** — desktop GUI (egui) with live loss curve and samples; safetensors export/import.
+* **0.3 (done)** — adversarial audit ([AUDIT.md](AUDIT.md)): hostile input files, atomic
+  checkpoints, option validation, Windows/macOS memory probes; data-parallel replicas.
+* **0.4** — memory-mapped corpora larger than RAM; desktop GUI (egui) with live loss curve and
+  samples; safetensors export/import; whatever the first many-core measurement calls for.
 * **0.5** — opt-in GPU backend (`wgpu`) behind a Cargo feature; community benchmark table.
 * **1.0** — the command-line messages in the project's usual languages; releases for Windows,
-  Linux and macOS built by CI; an extensive adversarial audit before the announcement.
+  Linux and macOS built by CI; a second adversarial audit (by someone other than the author of the
+  code) before the announcement.
 
 ## 6. Open questions
 
@@ -114,13 +147,20 @@ feed-forward and attention blocks.
 
 ## 7. What has been verified so far
 
-* 70 unit tests pass (release build, Linux).
+* 117 tests pass (release build, Linux): unit tests of the library and of the command line, and
+  end-to-end runs of the real binary. The core suite ran 40 times in a row in parallel mode
+  without a failure; before the fix of A-24 it failed in 2 of 13 runs.
+* The adversarial audit of 0.2 ([AUDIT.md](AUDIT.md)): 15 findings reproduced against a 0.2.0 binary
+  and gone in 0.3.0, two suspicions that did not reproduce, seven found by reading the code, and
+  one (A-24) found by verifying 0.3.0 itself in a clean directory.
 * Short real runs on the synthetic corpus, byte and BPE vocabularies: the loss falls well below
   the untrained value in a few dozen steps and the generated text follows the grammar of the
   corpus; interrupting and resuming works, including from a 0.1 checkpoint.
 * Cached generation produces the same greedy text as the full forward pass, and the same text as
   before the cache for the first window.
 * Benchmarks on a 2-core AVX-512 virtual machine (table in the README).
-* **Not verified:** native Windows and macOS runs (the CI workflow builds and smoke-tests both but
-  has not run on GitHub yet); anything on more than two cores; anything beyond the 85 M `base`
+* **Not verified:** native Windows and macOS runs (the CI workflow builds and smoke-tests both; the
+  Windows memory probe, the macOS `vm_stat` parser on a real Mac, the directory lock and the
+  rename retry have only been run on Linux or by unit test); the build with Rust 1.95 (the new CI
+  job is the first test of it); the weekly dependency audit; anything on more than two cores; anything beyond the 85 M `base`
   preset; any real-world corpus; loading a GERMEN model in another engine.

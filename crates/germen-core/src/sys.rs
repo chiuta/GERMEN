@@ -9,8 +9,17 @@ pub fn worker_threads() -> usize {
 /// Stack size of the worker threads GERMEN creates.
 const WORKER_STACK_BYTES: usize = 8 * 1024 * 1024;
 
-/// A pool of exactly `threads` workers (at least one).
+/// Most worker threads a pool may have. Each one reserves a stack, so a typo such as
+/// `--threads 1000000` would otherwise try to reserve terabytes and could freeze the machine.
+pub const MAX_THREADS: usize = 1024;
+
+/// A pool of exactly `threads` workers (at least one, at most [`MAX_THREADS`]).
 pub fn build_pool(threads: usize) -> Result<rayon::ThreadPool, String> {
+    if threads > MAX_THREADS {
+        return Err(format!(
+            "{threads} de fire de lucru e prea mult (maximul acceptat este {MAX_THREADS})"
+        ));
+    }
     let n = threads.max(1);
     rayon::ThreadPoolBuilder::new()
         .num_threads(n)
@@ -120,7 +129,9 @@ pub fn peak_rss_mib() -> Option<f64> {
     }
 }
 
-/// Memory the operating system reports as available for new allocations (Linux only).
+/// Memory the operating system reports as available for new allocations, in bytes: `MemAvailable`
+/// on Linux, `ullAvailPhys` on Windows, free + inactive + speculative pages on macOS. `None`
+/// elsewhere, or when the system does not answer.
 pub fn available_memory_bytes() -> Option<u64> {
     #[cfg(target_os = "linux")]
     {
@@ -129,10 +140,108 @@ pub fn available_memory_bytes() -> Option<u64> {
         let kib: u64 = line.split_whitespace().nth(1)?.parse().ok()?;
         Some(kib * 1024)
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(windows)]
+    {
+        windows::available_physical_memory()
+    }
+    #[cfg(target_os = "macos")]
+    {
+        // Absolute path: never run whatever `vm_stat` happens to come first on PATH.
+        let output = std::process::Command::new("/usr/bin/vm_stat")
+            .output()
+            .ok()?;
+        output
+            .status
+            .success()
+            .then(|| parse_vm_stat(&String::from_utf8_lossy(&output.stdout)))
+            .flatten()
+    }
+    #[cfg(not(any(target_os = "linux", windows, target_os = "macos")))]
     {
         None
     }
+}
+
+/// Reads macOS `vm_stat` output: the page size from its first line, then the pages that can be
+/// handed to a new allocation without evicting anything in use (free, inactive, speculative).
+///
+/// (`vm_stat` itself already leaves the speculative pages out of "Pages free", so the three
+/// counts do not overlap.) Only compiled in for macOS and tests, but parsed identically
+/// everywhere so that it can be tested on any machine.
+#[cfg(any(target_os = "macos", test))]
+fn parse_vm_stat(text: &str) -> Option<u64> {
+    let first = text.lines().next()?;
+    let page_size: u64 = first
+        .split("page size of")
+        .nth(1)?
+        .split_whitespace()
+        .next()?
+        .parse()
+        .ok()?;
+    let pages = |label: &str| -> Option<u64> {
+        let line = text.lines().find(|l| l.starts_with(label))?;
+        line.split(':')
+            .nth(1)?
+            .trim()
+            .trim_end_matches('.')
+            .parse()
+            .ok()
+    };
+    let available = pages("Pages free")?
+        .checked_add(pages("Pages inactive")?)?
+        .checked_add(pages("Pages speculative").unwrap_or(0))?;
+    available.checked_mul(page_size)
+}
+
+#[cfg(windows)]
+#[allow(unsafe_code)]
+mod windows {
+    //! The one place GERMEN calls the operating system directly (no `windows-sys` dependency for
+    //! a single function): `GlobalMemoryStatusEx`, which has been in kernel32 since Windows 2000.
+
+    #[repr(C)]
+    struct MemoryStatusEx {
+        length: u32,
+        memory_load: u32,
+        total_phys: u64,
+        avail_phys: u64,
+        total_page_file: u64,
+        avail_page_file: u64,
+        total_virtual: u64,
+        avail_virtual: u64,
+        avail_extended_virtual: u64,
+    }
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GlobalMemoryStatusEx(buffer: *mut MemoryStatusEx) -> i32;
+    }
+
+    /// Physical memory that can be allocated right now (free plus reclaimable standby pages).
+    pub(super) fn available_physical_memory() -> Option<u64> {
+        let mut status = MemoryStatusEx {
+            length: std::mem::size_of::<MemoryStatusEx>() as u32,
+            memory_load: 0,
+            total_phys: 0,
+            avail_phys: 0,
+            total_page_file: 0,
+            avail_page_file: 0,
+            total_virtual: 0,
+            avail_virtual: 0,
+            avail_extended_virtual: 0,
+        };
+        // SAFETY: `status` is a live, correctly laid-out MEMORYSTATUSEX whose `dwLength` is set,
+        // which is everything the call requires; it only writes inside that structure.
+        let ok = unsafe { GlobalMemoryStatusEx(&mut status) };
+        (ok != 0).then_some(status.avail_phys)
+    }
+}
+
+/// How much memory a run may plan to use: 90 % of what the OS reports as available, or 256 GiB
+/// where it cannot tell.
+pub fn memory_limit_bytes() -> f64 {
+    const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
+    available_memory_bytes().map_or(256.0 * GIB, |a| 0.9 * a as f64)
 }
 
 /// Refuses a configuration whose estimated memory use cannot fit: more than 90 % of the memory
@@ -142,7 +251,7 @@ pub fn available_memory_bytes() -> Option<u64> {
 pub fn check_memory_fits(need_bytes: u64, batch: usize, seq: usize) -> Result<(), String> {
     const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
     let need = need_bytes as f64 / GIB;
-    let limit = available_memory_bytes().map_or(256.0, |a| 0.9 * a as f64 / GIB);
+    let limit = memory_limit_bytes() / GIB;
     if need > limit {
         return Err(format!(
             "memoria estimată pentru lot {batch} × context {seq} este ~{need:.1} GiB, \
@@ -187,6 +296,50 @@ mod tests {
         assert!(check_memory_fits(64 * 1024 * 1024, 1, 8).is_ok());
         let err = check_memory_fits(100_000 * 1024 * 1024 * 1024, 16, 9999).unwrap_err();
         assert!(err.contains("--batch") && err.contains("--seq"));
+    }
+
+    #[test]
+    fn available_memory_is_known_on_the_platforms_germen_is_built_for() {
+        // Up to 0.2.0 only Linux answered, so on Windows and macOS (where GERMEN is released)
+        // `check_memory_fits` never protected anything.
+        if cfg!(any(target_os = "linux", windows, target_os = "macos")) {
+            let bytes = available_memory_bytes().expect("the OS must report available memory");
+            assert!(bytes > 16 * 1024 * 1024, "{bytes} B is implausibly little");
+            // A request for more than that must be refused with the same OS-derived limit.
+            assert!(check_memory_fits(bytes.saturating_mul(2), 1, 1).is_err());
+        }
+    }
+
+    #[test]
+    fn vm_stat_output_is_understood() {
+        let sample = "Mach Virtual Memory Statistics: (page size of 16384 bytes)\n\
+                      Pages free:                               11263.\n\
+                      Pages active:                            306417.\n\
+                      Pages inactive:                          297866.\n\
+                      Pages speculative:                         8001.\n\
+                      Pages throttled:                              0.\n\
+                      Pages wired down:                        119870.\n";
+        assert_eq!(parse_vm_stat(sample), Some((11263 + 297866 + 8001) * 16384));
+        assert_eq!(parse_vm_stat(""), None);
+        assert_eq!(parse_vm_stat("no page size here\nPages free: 1.\n"), None);
+        assert_eq!(
+            parse_vm_stat("(page size of 4096 bytes)\nPages free: 1.\n"),
+            None,
+            "inactive pages are missing"
+        );
+        assert_eq!(
+            parse_vm_stat("(page size of 4096 bytes)\nPages free: 5.\nPages inactive: 7.\n"),
+            Some(12 * 4096),
+            "speculative pages are optional"
+        );
+    }
+
+    #[test]
+    fn absurd_thread_counts_are_refused() {
+        assert!(build_pool(MAX_THREADS + 1).is_err());
+        assert!(build_pool(usize::MAX).is_err());
+        assert!(run_in_pool(Some(1_000_000), || ()).is_err());
+        assert!(build_pool(2).is_ok());
     }
 
     #[test]

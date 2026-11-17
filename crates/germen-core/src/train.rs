@@ -6,13 +6,15 @@
 
 use crate::checkpoint::{self, Meta};
 use crate::config::GptConfig;
-use crate::data::{Corpus, Rng, Split};
+use crate::data::{Batch, Corpus, Rng, Split};
+use crate::fsutil::DirLock;
 use crate::generate::{SampleOptions, generate};
 use crate::gradients;
 use crate::model::Gpt;
 use crate::tokenizer::Tokenizer;
 use burn::optim::{AdamWConfig, GradientsAccumulator, GradientsParams, ModuleOptimizer};
 use burn::prelude::*;
+use rayon::prelude::*;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
@@ -55,6 +57,13 @@ pub struct TrainOptions {
     pub sample_every: usize,
     /// Seed for initialisation and batch sampling.
     pub seed: u64,
+    /// Data-parallel replicas per micro-batch: the windows of a micro-batch are split among this
+    /// many copies of the model, each running forward and backward on its own autodiff graph on a
+    /// different worker thread, and their gradients are summed. The result equals one big graph
+    /// (up to the rounding of the sums), but the serial parts of a step (the many small
+    /// element-wise operations, which do not scale with threads) now run side by side.
+    /// `0` chooses automatically, see [`plan_replicas`]; `1` is the ordinary single-graph step.
+    pub replicas: usize,
 }
 
 impl Default for TrainOptions {
@@ -76,6 +85,7 @@ impl Default for TrainOptions {
             log_every: 10,
             sample_every: 0,
             seed: 1,
+            replicas: 0,
         }
     }
 }
@@ -100,6 +110,31 @@ impl TrainOptions {
         }
         if self.eval_every > 0 && self.eval_batches == 0 {
             return Err("--eval-batches trebuie să fie cel puțin 1 când validarea e activă".into());
+        }
+        if !(self.beta2.is_finite() && (0.0..1.0).contains(&self.beta2)) {
+            return Err("beta2 trebuie să fie în [0, 1)".into());
+        }
+        if !(self.weight_decay.is_finite() && self.weight_decay >= 0.0) {
+            return Err("--weight-decay trebuie să fie un număr finit, cel puțin 0".into());
+        }
+        // NaN used to compare false with `> 0` and switch the clipping off without a word.
+        if !(self.grad_clip.is_finite() && self.grad_clip >= 0.0) {
+            return Err(
+                "--grad-clip trebuie să fie un număr finit, cel puțin 0 (0 = oprit)".into(),
+            );
+        }
+        // Far beyond any real run, but small enough that the products below cannot overflow.
+        const MAX_TOKENS_PER_STEP: usize = 1 << 40;
+        let tokens_per_step = self
+            .batch
+            .checked_mul(self.seq)
+            .and_then(|n| n.checked_mul(self.accum))
+            .filter(|&n| n <= MAX_TOKENS_PER_STEP);
+        if tokens_per_step.is_none() {
+            return Err(format!(
+                "--batch × --seq × --accum ({} × {} × {}) depășește {MAX_TOKENS_PER_STEP} de tokeni pe pas",
+                self.batch, self.seq, self.accum
+            ));
         }
         Ok(())
     }
@@ -152,6 +187,8 @@ pub enum Event<'a> {
         /// When resuming: whether the AdamW moment estimates were restored (checkpoints from
         /// before GERMEN 0.2 have none and start them from zero).
         optimizer_restored: bool,
+        /// Data-parallel replicas per micro-batch actually used (1 = the ordinary step).
+        replicas: usize,
     },
     /// Periodic training progress.
     Step {
@@ -263,14 +300,179 @@ fn save_checkpoint(
     meta: &Meta,
     on_event: &mut dyn FnMut(Event<'_>),
 ) -> Result<(), String> {
-    checkpoint::save(out_dir, model, cfg, meta)?;
-    checkpoint::save_optimizer(out_dir, optim)?;
-    tokenizer.save(out_dir)?;
+    // One set: weights, optimizer, tokenizer, architecture and (last) the progress record.
+    checkpoint::save_all(out_dir, model, cfg, meta, Some(optim), Some(tokenizer))?;
     on_event(Event::Saved {
         step: meta.step,
         dir: out_dir,
     });
     Ok(())
+}
+
+/// How many replicas to run per micro-batch of `batch` windows of `seq` tokens.
+///
+/// A `requested` number (non-zero) is honoured, only capped at the number of windows. `0` means
+/// automatic: one replica per worker thread, but never more than there are windows, and fewer
+/// if the extra sets of gradients would not fit in memory.
+pub fn plan_replicas(cfg: &GptConfig, batch: usize, seq: usize, requested: usize) -> usize {
+    let batch = batch.max(1);
+    if requested > 0 {
+        return requested.min(batch);
+    }
+    let workers = crate::sys::worker_threads();
+    let limit = crate::sys::memory_limit_bytes();
+    let mut replicas = workers.min(batch);
+    while replicas > 1
+        && cfg.estimate_train_bytes_replicated(batch, seq, replicas.min(workers)) as f64 > limit
+    {
+        replicas -= 1;
+    }
+    replicas
+}
+
+/// `a + b`, gradient by gradient.
+fn add_gradients(model: &Gpt, a: GradientsParams, b: GradientsParams) -> GradientsParams {
+    let mut sum = GradientsAccumulator::new();
+    sum.accumulate(model, a);
+    sum.accumulate(model, b);
+    sum.grads()
+}
+
+/// Forward and backward of one replica: a copy of the model with an autodiff graph of its own
+/// (`fork`), so that replicas on different threads never share a graph or its lock.
+fn replica_gradients(
+    model: &Gpt,
+    part: &Batch,
+    weight: f32,
+    accum: usize,
+    device: &Device,
+) -> Result<(GradientsParams, f32), f32> {
+    let replica = model.clone().fork(device);
+    let (x, y) = part.to_tensors(device);
+    let loss = replica.loss(x, y);
+    let value = loss.clone().into_scalar::<f32>();
+    if !value.is_finite() {
+        return Err(value);
+    }
+    let weighted = loss.mul_scalar(weight);
+    let scaled = if accum > 1 {
+        weighted.div_scalar(accum as f32)
+    } else {
+        weighted
+    };
+    Ok((
+        GradientsParams::from_grads(scaled.backward(), &replica),
+        value,
+    ))
+}
+
+/// Gradients of `loss / accum` for one micro-batch, and the micro-batch's mean loss (not scaled).
+///
+/// With `replicas > 1` the windows are split among that many replicas, each weighted by its share
+/// of the windows, so the sum equals the gradient of the mean over the whole micro-batch (up to
+/// rounding). The replicas are dealt to as many slots as there are worker threads; a slot runs its
+/// replicas in turn, adding their gradients as it goes, and the slots' sums are then added in a
+/// fixed pairwise order: the result does not depend on which thread ran what, only on how many
+/// threads there are. `Err(loss)` is a loss that was NaN or infinite.
+pub(crate) fn micro_batch_gradients(
+    model: &Gpt,
+    batch: &Batch,
+    replicas: usize,
+    accum: usize,
+    device: &Device,
+) -> Result<(GradientsParams, f32), f32> {
+    let replicas = replicas.clamp(1, batch.batch.max(1));
+    if replicas == 1 {
+        let (x, y) = batch.to_tensors(device);
+        let loss = model.loss(x, y);
+        let value = loss.clone().into_scalar::<f32>();
+        if !value.is_finite() {
+            return Err(value);
+        }
+        let scaled = if accum > 1 {
+            loss.div_scalar(accum as f32)
+        } else {
+            loss
+        };
+        return Ok((GradientsParams::from_grads(scaled.backward(), model), value));
+    }
+
+    let parts = batch.split(replicas);
+    let slots = replicas.min(crate::sys::worker_threads()).max(1);
+    let total = batch.batch as f32;
+    let sums: Vec<Result<Option<(GradientsParams, f32)>, f32>> = (0..slots)
+        .into_par_iter()
+        .map(|slot| {
+            let mut sum: Option<(GradientsParams, f32)> = None;
+            for part in parts.iter().skip(slot).step_by(slots) {
+                let weight = part.batch as f32 / total;
+                let (grads, value) = replica_gradients(model, part, weight, accum, device)?;
+                sum = Some(match sum {
+                    None => (grads, value * weight),
+                    Some((acc, loss)) => (add_gradients(model, acc, grads), loss + value * weight),
+                });
+            }
+            Ok(sum)
+        })
+        .collect();
+    let mut level: Vec<(GradientsParams, f32)> = Vec::with_capacity(slots);
+    for sum in sums {
+        level.extend(sum?);
+    }
+    while level.len() > 1 {
+        level = level
+            .into_par_iter()
+            .chunks(2)
+            .map(|mut pair| {
+                let last = pair.pop().expect("chunks are not empty");
+                match pair.pop() {
+                    Some((acc, loss)) => (add_gradients(model, acc, last.0), loss + last.1),
+                    None => last,
+                }
+            })
+            .collect();
+    }
+    Ok(level.pop().expect("a micro-batch has at least one replica"))
+}
+
+/// Forward and backward over `opts.accum` micro-batches; returns the summed gradients (each
+/// micro-batch's loss is divided by `accum`, so they equal those of one batch `accum` times
+/// larger) and the mean loss.
+///
+/// `should_stop` is asked before every micro-batch. When it says yes, the partial sum is dropped
+/// and `None` is returned: applying it would be a step on a smaller batch than the schedule
+/// assumes. This is what makes Ctrl-C answer within one micro-batch rather than one whole step
+/// (which with `--accum 64` on a big model can be minutes).
+#[allow(clippy::too_many_arguments)]
+fn accumulate_gradients(
+    model: &Gpt,
+    corpus: &Corpus,
+    opts: &TrainOptions,
+    replicas: usize,
+    rng: &mut Rng,
+    device: &Device,
+    step: usize,
+    lr: f64,
+    should_stop: &mut dyn FnMut() -> bool,
+) -> Result<Option<(GradientsParams, f32)>, String> {
+    let mut accumulator = GradientsAccumulator::new();
+    let mut step_loss = 0.0f32;
+    for _ in 0..opts.accum {
+        if should_stop() {
+            return Ok(None);
+        }
+        let batch = corpus.sample_batch(Split::Train, opts.batch, opts.seq, rng);
+        let (grads, value) = micro_batch_gradients(model, &batch, replicas, opts.accum, device)
+            .map_err(|bad| {
+                format!(
+                    "pierderea a devenit {bad} la pasul {step}; reduceți --lr (acum {lr:.2e}) \
+                     sau activați --grad-clip"
+                )
+            })?;
+        step_loss += value / opts.accum as f32;
+        accumulator.accumulate(model, grads);
+    }
+    Ok(Some((accumulator.grads(), step_loss)))
 }
 
 /// Trains `cfg` on `corpus` and writes checkpoints into `out_dir`.
@@ -297,11 +499,18 @@ pub fn train(
         ));
     }
     corpus.check_seq(opts.seq)?;
-    let est_memory_bytes = cfg.estimate_train_bytes(opts.batch, opts.seq);
+    let replicas = plan_replicas(cfg, opts.batch, opts.seq, opts.replicas);
+    let est_memory_bytes = cfg.estimate_train_bytes_replicated(
+        opts.batch,
+        opts.seq,
+        replicas.min(crate::sys::worker_threads()),
+    );
     crate::sys::check_memory_fits(est_memory_bytes, opts.batch, opts.seq)?;
+    // Held until this function returns: a second run in the same directory would interleave its
+    // files with ours into a model that never existed.
+    let _claim = DirLock::acquire(out_dir)?;
 
     let device = crate::train_device();
-    device.seed(opts.seed);
     let eval_device = device.clone().without_autodiff();
 
     let (mut model, mut meta) = if resume {
@@ -321,16 +530,27 @@ pub fn train(
         }
         (m, meta)
     } else {
-        (cfg.init(&device), Meta::default())
+        // Seeded and drawn in one step, not lazily and not racing: with replicas, several threads
+        // would otherwise be the first to touch the parameters, and another run in this process
+        // could take its share of the device's one random generator in between.
+        (cfg.init_seeded(&device, opts.seed), Meta::default())
     };
     meta.germen_version = crate::VERSION.to_string();
     meta.seed = opts.seed;
-    meta.corpus_bytes = corpus.len();
+    meta.corpus_bytes = corpus.bytes;
     meta.seq = opts.seq;
     meta.batch = opts.batch;
     meta.accum = opts.accum;
 
     let start_step = meta.step;
+    if start_step > opts.steps {
+        return Err(format!(
+            "punctul de control e deja la pasul {start_step}, iar --steps ({}) e numărul TOTAL \
+             de pași, nu cel de pași în plus; pentru a continua dați --steps mai mare decât \
+             {start_step}",
+            opts.steps
+        ));
+    }
     let tokens_per_step = opts.batch * opts.seq * opts.accum;
 
     // Clipping is done on the global norm by `gradients::clip_global_norm`, not by Burn.
@@ -354,7 +574,24 @@ pub fn train(
         bytes_per_token: corpus.bytes_per_token(),
         vocab_size: cfg.vocab_size,
         optimizer_restored,
+        replicas,
     });
+
+    if start_step == opts.steps {
+        // Already done (typically a `--resume` that is repeated until it has nothing left to do):
+        // succeed without touching the checkpoint.
+        return Ok(TrainReport {
+            final_step: start_step,
+            steps_run: 0,
+            tokens_seen: meta.tokens_seen,
+            last_train_loss: meta.last_train_loss.unwrap_or(f32::NAN),
+            last_val_loss: meta.last_val_loss,
+            best_val_loss: meta.best_val_loss,
+            elapsed_secs: 0.0,
+            tokens_per_sec: 0.0,
+            interrupted: false,
+        });
+    }
 
     let mut rng = Rng::new(opts.seed ^ (start_step as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15));
     let log_every = opts.log_every.max(1);
@@ -378,32 +615,22 @@ pub fn train(
         let started = Instant::now();
         let lr = opts.lr_at(step);
 
-        // Forward and backward over `accum` micro-batches; each loss is divided by `accum`, so
-        // the summed gradients equal those of one batch `accum` times larger.
-        let mut accumulator = GradientsAccumulator::new();
-        let mut step_loss = 0.0f32;
-        for _ in 0..opts.accum {
-            let batch = corpus.sample_batch(Split::Train, opts.batch, opts.seq, &mut rng);
-            let (x, y) = batch.to_tensors(&device);
-            let loss = model.loss(x, y);
-            let value = loss.clone().into_scalar::<f32>();
-            if !value.is_finite() {
-                return Err(format!(
-                    "pierderea a devenit {value} la pasul {step}; reduceți --lr (acum {lr:.2e}) \
-                     sau activați --grad-clip"
-                ));
-            }
-            step_loss += value / opts.accum as f32;
-            let scaled = if opts.accum > 1 {
-                loss.div_scalar(opts.accum as f32)
-            } else {
-                loss
-            };
-            let grads = GradientsParams::from_grads(scaled.backward(), &model);
-            accumulator.accumulate(&model, grads);
-        }
+        let Some((mut grads, step_loss)) = accumulate_gradients(
+            &model,
+            corpus,
+            opts,
+            replicas,
+            &mut rng,
+            &device,
+            step,
+            lr,
+            &mut || stop.load(Ordering::Relaxed),
+        )?
+        else {
+            interrupted = true;
+            break;
+        };
         last_loss = step_loss;
-        let mut grads = accumulator.grads();
         let grad_norm = if opts.grad_clip > 0.0 {
             gradients::clip_global_norm(&mut grads, &model, opts.grad_clip)
         } else {
@@ -709,6 +936,579 @@ mod tests {
     }
 
     #[test]
+    fn options_validation_rejects_values_that_would_break_the_run() {
+        let cfg = Preset::Nano.config(64);
+        let base = TrainOptions {
+            seq: 64,
+            ..TrainOptions::default()
+        };
+        assert!(base.validate(&cfg).is_ok());
+        let bad: Vec<(&str, TrainOptions)> = vec![
+            (
+                "beta2 = 1",
+                TrainOptions {
+                    beta2: 1.0,
+                    ..base.clone()
+                },
+            ),
+            (
+                "beta2 < 0",
+                TrainOptions {
+                    beta2: -0.1,
+                    ..base.clone()
+                },
+            ),
+            (
+                "beta2 NaN",
+                TrainOptions {
+                    beta2: f32::NAN,
+                    ..base.clone()
+                },
+            ),
+            (
+                "negative weight decay",
+                TrainOptions {
+                    weight_decay: -0.5,
+                    ..base.clone()
+                },
+            ),
+            (
+                "NaN weight decay",
+                TrainOptions {
+                    weight_decay: f32::NAN,
+                    ..base.clone()
+                },
+            ),
+            (
+                "negative clip",
+                TrainOptions {
+                    grad_clip: -1.0,
+                    ..base.clone()
+                },
+            ),
+            (
+                "NaN clip (used to switch clipping off silently)",
+                TrainOptions {
+                    grad_clip: f32::NAN,
+                    ..base.clone()
+                },
+            ),
+            (
+                "infinite clip",
+                TrainOptions {
+                    grad_clip: f32::INFINITY,
+                    ..base.clone()
+                },
+            ),
+            (
+                "accum = usize::MAX",
+                TrainOptions {
+                    accum: usize::MAX,
+                    ..base.clone()
+                },
+            ),
+            (
+                "tokens per step overflow",
+                TrainOptions {
+                    batch: usize::MAX / 2,
+                    ..base.clone()
+                },
+            ),
+        ];
+        for (what, opts) in bad {
+            assert!(opts.validate(&cfg).is_err(), "{what} must be rejected");
+        }
+        // Zero clipping is the documented way to switch it off.
+        assert!(
+            TrainOptions {
+                grad_clip: 0.0,
+                ..base.clone()
+            }
+            .validate(&cfg)
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn resuming_past_the_requested_steps_is_an_error_and_at_them_a_quiet_no_op() {
+        let dir = std::env::temp_dir().join(format!("germen-resume-end-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let corpus = Corpus::from_bytes(demo_corpus(30_000, 2).into_bytes(), 0.1).unwrap();
+        let cfg = Preset::Nano.config(32);
+        let opts = TrainOptions {
+            steps: 6,
+            batch: 4,
+            seq: 32,
+            eval_every: 0,
+            save_every: 0,
+            ..TrainOptions::default()
+        };
+        let stop = AtomicBool::new(false);
+        train(&corpus, &cfg, &opts, &dir, false, &stop, &mut |_| {}).unwrap();
+        let before = checkpoint::load_meta(&dir).unwrap();
+        assert_eq!(before.step, 6);
+
+        // `--steps` is the TOTAL: asking for fewer than were done is a mistake worth a message
+        // (it used to rewrite the checkpoint with the new run's settings and say nothing).
+        let fewer = TrainOptions {
+            steps: 3,
+            batch: 8,
+            ..opts.clone()
+        };
+        let err = train(&corpus, &cfg, &fewer, &dir, true, &stop, &mut |_| {}).unwrap_err();
+        assert!(err.contains("pasul 6") && err.contains("--steps"), "{err}");
+        assert_eq!(
+            checkpoint::load_meta(&dir).unwrap(),
+            before,
+            "nothing may be rewritten"
+        );
+
+        // Asking for exactly what is done is how a "keep resuming until finished" script ends:
+        // success, no work, no rewrite, no sample.
+        let (mut saved, mut sampled) = (0, 0);
+        let same = TrainOptions {
+            batch: 8,
+            ..opts.clone()
+        };
+        let report = train(&corpus, &cfg, &same, &dir, true, &stop, &mut |e| match e {
+            Event::Saved { .. } => saved += 1,
+            Event::Sample { .. } => sampled += 1,
+            _ => {}
+        })
+        .unwrap();
+        assert_eq!((report.final_step, report.steps_run), (6, 0));
+        assert!(!report.interrupted);
+        assert_eq!(
+            (saved, sampled),
+            (0, 0),
+            "no checkpoint and no sample for a no-op"
+        );
+        assert_eq!(
+            checkpoint::load_meta(&dir).unwrap(),
+            before,
+            "nothing may be rewritten"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn metadata_counts_the_corpus_in_bytes_even_when_its_tokens_are_fewer() {
+        let dir = std::env::temp_dir().join(format!("germen-meta-bytes-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let text = demo_corpus(40_000, 3).into_bytes();
+        let bpe = crate::bpe::Bpe::train(&text, 400, &mut |_, _| {}).unwrap();
+        let corpus = Corpus::build(&text, 0.1, Tokenizer::Bpe(bpe)).unwrap();
+        assert!(
+            corpus.len() * 2 < corpus.bytes,
+            "BPE must compress for this test to mean anything"
+        );
+        let cfg = Preset::Nano
+            .config(32)
+            .with_vocab(corpus.tokenizer.vocab_size());
+        let opts = TrainOptions {
+            steps: 2,
+            batch: 4,
+            seq: 32,
+            eval_every: 0,
+            save_every: 0,
+            ..TrainOptions::default()
+        };
+        let stop = AtomicBool::new(false);
+        train(&corpus, &cfg, &opts, &dir, false, &stop, &mut |_| {}).unwrap();
+        // The field is called `corpus_bytes`; up to 0.2.0 it held the number of TOKENS.
+        assert_eq!(
+            checkpoint::load_meta(&dir).unwrap().corpus_bytes,
+            corpus.bytes
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_run_with_a_tiny_context_still_ends_with_its_sample() {
+        // The end-of-run sample asks for a 128-token window; the model only has 4 positions.
+        let dir = std::env::temp_dir().join(format!("germen-tiny-ctx-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let corpus = Corpus::from_bytes(demo_corpus(20_000, 4).into_bytes(), 0.1).unwrap();
+        let cfg = Preset::Nano.config(4);
+        let opts = TrainOptions {
+            steps: 2,
+            batch: 2,
+            seq: 4,
+            eval_every: 0,
+            save_every: 0,
+            ..TrainOptions::default()
+        };
+        let stop = AtomicBool::new(false);
+        let mut sampled = false;
+        train(&corpus, &cfg, &opts, &dir, false, &stop, &mut |e| {
+            sampled |= matches!(e, Event::Sample { .. });
+        })
+        .unwrap();
+        assert!(sampled);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Every gradient of `model`, flattened in parameter order.
+    fn flat_gradients(grads: &GradientsParams, model: &Gpt) -> Vec<f32> {
+        struct Collect<'a>(&'a GradientsParams, Vec<f32>);
+        impl burn::module::ModuleVisitor for Collect<'_> {
+            fn visit_float<const D: usize>(&mut self, param: &burn::module::Param<Tensor<D>>) {
+                if let Some(g) = self.0.get::<D>(param.id) {
+                    self.1.extend(g.into_data().try_to_vec::<f32>().unwrap());
+                }
+            }
+        }
+        let mut all = Collect(grads, Vec::new());
+        burn::module::Module::visit(model, &mut all);
+        all.1
+    }
+
+    #[test]
+    fn replicas_give_the_same_gradients_as_one_graph() {
+        let device = crate::train_device();
+        let cfg = Preset::Nano.config(16);
+        let model = cfg.init_seeded(&device, 3);
+        let mut rng = Rng::new(11);
+        // Seven windows: split in 2, 3 and 7 the parts are unequal, which the weights must handle.
+        let batch = Batch::random(7, 16, cfg.vocab_size, &mut rng);
+
+        let (reference, reference_loss) =
+            micro_batch_gradients(&model, &batch, 1, 1, &device).unwrap();
+        let want = flat_gradients(&reference, &model);
+        let scale = want.iter().fold(0f32, |m, g| m.max(g.abs()));
+        assert!(scale > 0.0 && want.iter().all(|g| g.is_finite()));
+
+        for replicas in [2, 3, 7, 50] {
+            let (grads, loss) =
+                micro_batch_gradients(&model, &batch, replicas, 1, &device).unwrap();
+            let got = flat_gradients(&grads, &model);
+            assert_eq!(got.len(), want.len());
+            let worst = got
+                .iter()
+                .zip(&want)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0f32, f32::max);
+            assert!(
+                worst <= 2e-4 * scale,
+                "{replicas} replicas: worst difference {worst} (scale {scale})"
+            );
+            assert!(
+                (loss - reference_loss).abs() < 1e-4,
+                "{replicas}: loss {loss} vs {reference_loss}"
+            );
+        }
+
+        // With accumulation the gradient is that of loss / accum, whatever the replica count.
+        let (quarter, _) = micro_batch_gradients(&model, &batch, 3, 4, &device).unwrap();
+        let got = flat_gradients(&quarter, &model);
+        let worst = got
+            .iter()
+            .zip(&want)
+            .map(|(a, b)| (a - b / 4.0).abs())
+            .fold(0f32, f32::max);
+        assert!(
+            worst <= 2e-4 * scale / 4.0,
+            "accum 4: worst difference {worst}"
+        );
+    }
+
+    /// Trains a nano model for `steps` steps; returns the loss of every step and the logits of
+    /// the saved model on a fixed input.
+    fn nano_run(name: &str, opts: &TrainOptions) -> (Vec<f32>, Vec<f32>) {
+        let dir = std::env::temp_dir().join(format!("germen-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let corpus = Corpus::from_bytes(demo_corpus(30_000, 4).into_bytes(), 0.1).unwrap();
+        let cfg = Preset::Nano.config(opts.seq);
+        let mut losses = Vec::new();
+        let stop = AtomicBool::new(false);
+        train(&corpus, &cfg, opts, &dir, false, &stop, &mut |e| {
+            if let Event::Step { loss, .. } = e {
+                losses.push(loss);
+            }
+        })
+        .unwrap();
+        let (model, _, _) = checkpoint::load(&dir, &Device::flex()).unwrap();
+        let ids: Vec<i32> = (0..opts.seq as i32).map(|i| (i * 7 + 3) % 256).collect();
+        let x = Tensor::<2, Int>::from_data(TensorData::new(ids, [1, opts.seq]), &Device::flex());
+        let logits = model.forward(x).into_data().try_to_vec::<f32>().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        (losses, logits)
+    }
+
+    #[test]
+    fn replicated_training_is_reproducible_for_a_fixed_seed() {
+        // The initial weights are drawn before the replicas race to use them, and the gradient
+        // sums have a fixed order: two runs with the same settings must agree to the last bit.
+        for replicas in [1, 2, 3] {
+            let opts = TrainOptions {
+                steps: 6,
+                batch: 6,
+                seq: 16,
+                lr: 3e-3,
+                warmup: 2,
+                eval_every: 0,
+                save_every: 0,
+                log_every: 1,
+                replicas,
+                ..TrainOptions::default()
+            };
+            let a = nano_run(&format!("repro-a-{replicas}"), &opts);
+            let b = nano_run(&format!("repro-b-{replicas}"), &opts);
+            assert_eq!(a.0.len(), 6);
+            assert_eq!(
+                a.0, b.0,
+                "{replicas} replicas: losses differ between identical runs"
+            );
+            assert_eq!(
+                a.1, b.1,
+                "{replicas} replicas: weights differ between identical runs"
+            );
+        }
+    }
+
+    #[test]
+    fn replicated_training_learns_like_the_ordinary_step() {
+        let mk = |replicas| TrainOptions {
+            steps: 24,
+            batch: 6,
+            accum: 2,
+            seq: 32,
+            lr: 3e-3,
+            warmup: 3,
+            eval_every: 0,
+            save_every: 0,
+            log_every: 4,
+            replicas,
+            ..TrainOptions::default()
+        };
+        let (single, _) = nano_run("learn-1", &mk(1));
+        let (many, _) = nano_run("learn-3", &mk(3));
+        for losses in [&single, &many] {
+            assert!(losses.last().unwrap() < &(losses[0] - 0.3), "{losses:?}");
+        }
+        // Same data, same maths, different rounding: the curves stay close.
+        for (a, b) in single.iter().zip(&many) {
+            assert!((a - b).abs() < 0.15, "{single:?} vs {many:?}");
+        }
+    }
+
+    /// Runs `work` on a thread of its own and fails the test if it has not finished in `secs`
+    /// seconds: a deadlock must fail one test, not hang the whole run.
+    fn within<T: Send + 'static>(secs: u64, work: impl FnOnce() -> T + Send + 'static) -> T {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(work());
+        });
+        rx.recv_timeout(std::time::Duration::from_secs(secs))
+            .expect("deadlock: the work did not finish in time")
+    }
+
+    #[test]
+    fn replicas_never_deadlock_whatever_the_pool_size() {
+        // The attempt at data parallelism that 0.2 rejected let several threads share one autodiff
+        // graph, and hung (every thread waiting, 0 % CPU) with more workers than pool threads.
+        // Replicas have graphs of their own: pools of one to five threads, with fewer, as many and
+        // more replicas than threads, must all get through.
+        for threads in [1usize, 2, 3, 5] {
+            for replicas in [2usize, 3, 4, 8] {
+                within(180, move || {
+                    let cfg = Preset::Nano.config(16);
+                    let pool = rayon::ThreadPoolBuilder::new()
+                        .num_threads(threads)
+                        .build()
+                        .unwrap();
+                    pool.install(|| {
+                        let device = crate::train_device();
+                        let model = cfg.init_seeded(&device, 5);
+                        let mut rng = Rng::new(2);
+                        let batch = Batch::random(8, 16, cfg.vocab_size, &mut rng);
+                        for _ in 0..2 {
+                            let (grads, loss) =
+                                micro_batch_gradients(&model, &batch, replicas, 1, &device)
+                                    .unwrap();
+                            assert!(loss.is_finite(), "{threads} threads, {replicas} replicas");
+                            drop(grads);
+                        }
+                    });
+                });
+            }
+        }
+    }
+
+    /// Makes the first float parameter NaN and leaves the others alone.
+    struct PoisonFirst(bool);
+
+    impl burn::module::ModuleMapper for PoisonFirst {
+        fn map_float<const D: usize>(
+            &mut self,
+            param: burn::module::Param<Tensor<D>>,
+        ) -> burn::module::Param<Tensor<D>> {
+            if std::mem::replace(&mut self.0, true) {
+                param
+            } else {
+                param.map(|t| t.mul_scalar(f32::NAN))
+            }
+        }
+    }
+
+    #[test]
+    fn a_non_finite_loss_is_reported_whatever_the_replica_count() {
+        let device = crate::train_device();
+        let cfg = Preset::Nano.config(16);
+        let model = cfg.init_seeded(&device, 9);
+        let mut rng = Rng::new(4);
+        let batch = Batch::random(6, 16, cfg.vocab_size, &mut rng);
+        let poisoned = burn::module::Module::map(model, &mut PoisonFirst(false));
+        for replicas in [1, 3, 6] {
+            match micro_batch_gradients(&poisoned, &batch, replicas, 1, &device) {
+                Ok(_) => panic!("{replicas} replicas: NaN weights must give an error"),
+                Err(bad) => assert!(!bad.is_finite(), "{replicas} replicas: {bad}"),
+            }
+        }
+    }
+
+    #[test]
+    fn replica_planning_respects_requests_windows_and_memory() {
+        let cfg = Preset::Nano.config(64);
+        assert_eq!(plan_replicas(&cfg, 8, 64, 1), 1);
+        assert_eq!(plan_replicas(&cfg, 8, 64, 5), 5);
+        assert_eq!(
+            plan_replicas(&cfg, 3, 64, 100),
+            3,
+            "never more than the windows"
+        );
+        assert_eq!(plan_replicas(&cfg, 1, 64, 0), 1);
+        let auto = plan_replicas(&cfg, 8, 64, 0);
+        assert!(
+            (1..=8.min(crate::sys::worker_threads())).contains(&auto),
+            "{auto}"
+        );
+
+        // A model whose gradient copies cannot fit is not replicated by itself.
+        let huge = GptConfig::new(256, 64, 1024, 16, 16_384, 65_536);
+        assert_eq!(plan_replicas(&huge, 8, 64, 0), 1);
+        assert!(
+            cfg.estimate_train_bytes_replicated(8, 64, 4)
+                > cfg.estimate_train_bytes_replicated(8, 64, 2)
+        );
+        assert_eq!(
+            cfg.estimate_train_bytes_replicated(8, 64, 1),
+            cfg.estimate_train_bytes(8, 64)
+        );
+    }
+
+    #[test]
+    fn the_start_event_reports_the_replicas_in_use() {
+        let dir = std::env::temp_dir().join(format!("germen-start-rep-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let corpus = Corpus::from_bytes(demo_corpus(20_000, 4).into_bytes(), 0.1).unwrap();
+        let cfg = Preset::Nano.config(16);
+        let opts = TrainOptions {
+            steps: 1,
+            batch: 4,
+            seq: 16,
+            replicas: 3,
+            eval_every: 0,
+            ..TrainOptions::default()
+        };
+        let stop = AtomicBool::new(false);
+        let mut seen = 0;
+        train(&corpus, &cfg, &opts, &dir, false, &stop, &mut |e| {
+            if let Event::Start { replicas, .. } = e {
+                seen = replicas;
+            }
+        })
+        .unwrap();
+        assert_eq!(seen, 3);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_stop_request_is_honoured_between_micro_batches() {
+        let device = crate::train_device();
+        let corpus = Corpus::from_bytes(demo_corpus(30_000, 9).into_bytes(), 0.1).unwrap();
+        let cfg = Preset::Nano.config(32);
+        let model = cfg.init_seeded(&device, 1);
+        let opts = TrainOptions {
+            batch: 2,
+            seq: 32,
+            accum: 8,
+            ..TrainOptions::default()
+        };
+
+        // Stop requested while the third micro-batch is about to start: no half step comes back
+        // and exactly two windows were drawn, not eight.
+        let mut rng = Rng::new(5);
+        let mut asked = 0;
+        let out = accumulate_gradients(
+            &model,
+            &corpus,
+            &opts,
+            1,
+            &mut rng,
+            &device,
+            0,
+            1e-3,
+            &mut || {
+                asked += 1;
+                asked > 2
+            },
+        )
+        .unwrap();
+        assert!(out.is_none());
+        assert_eq!(asked, 3);
+        let mut reference = Rng::new(5);
+        for _ in 0..2 {
+            corpus.sample_batch(Split::Train, 2, 32, &mut reference);
+        }
+        assert_eq!(rng.next_u64(), reference.next_u64());
+
+        // Never asked to stop: all eight micro-batches, a sensible loss and real gradients.
+        let mut rng = Rng::new(5);
+        let (grads, loss) = accumulate_gradients(
+            &model,
+            &corpus,
+            &opts,
+            1,
+            &mut rng,
+            &device,
+            0,
+            1e-3,
+            &mut || false,
+        )
+        .unwrap()
+        .unwrap();
+        assert!((loss - 256f32.ln()).abs() < 0.5, "loss {loss}");
+        assert!(gradients::global_norm(&grads, &model) > 0.0);
+    }
+
+    #[test]
+    fn a_directory_in_use_by_another_run_is_refused_and_released_afterwards() {
+        let dir = std::env::temp_dir().join(format!("germen-claim-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let corpus = Corpus::from_bytes(demo_corpus(20_000, 6).into_bytes(), 0.1).unwrap();
+        let cfg = Preset::Nano.config(32);
+        let opts = TrainOptions {
+            steps: 2,
+            batch: 2,
+            seq: 32,
+            eval_every: 0,
+            ..TrainOptions::default()
+        };
+        let stop = AtomicBool::new(false);
+        {
+            let _other_run = DirLock::acquire(&dir).unwrap();
+            let err = train(&corpus, &cfg, &opts, &dir, false, &stop, &mut |_| {}).unwrap_err();
+            assert!(err.contains("altă rulare"), "{err}");
+            assert!(!dir.join(checkpoint::WEIGHTS_FILE).exists());
+        }
+        // The other run has ended: the directory is ours again.
+        train(&corpus, &cfg, &opts, &dir, false, &stop, &mut |_| {}).unwrap();
+        assert!(dir.join(checkpoint::WEIGHTS_FILE).exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn restored_optimizer_state_continues_exactly_like_uninterrupted_training() {
         let dir = std::env::temp_dir().join(format!("germen-optim-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -731,7 +1531,7 @@ mod tests {
         };
 
         // Three steps, then a checkpoint.
-        let mut model = cfg.init(&device);
+        let mut model = cfg.init_seeded(&device, 1);
         let mut optim = adam();
         for i in 0..3 {
             model = step(model, &mut optim, i);
