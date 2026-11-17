@@ -4,6 +4,79 @@ All notable changes to GERMEN are listed here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [0.4.0] — 2026-11-17
+
+A second adversarial audit, of 0.3.0, aimed at the places where a damaged, mixed-up or half-written
+checkpoint, or a plain mistake, still produced a silent wrong result. Ten findings (B-01 … B-10),
+each with its evidence and its test, in [docs/AUDIT.md](docs/AUDIT.md) (Part II). Two of the
+changes alter what a command does, which is why this is 0.4.0 and not 0.3.1: a fresh `train` no
+longer replaces an existing checkpoint, and `--resume` needs `meta.json`.
+
+### Added
+- **A manifest in every checkpoint.** `meta.json` records the size and the SHA-256 of
+  `config.json`, `weights.bpk`, `optimizer.bpk` and `tokenizer.json`, and every load checks the
+  files it reads: a flipped bit, a truncated or half-copied file, or the weights of one save next
+  to the optimizer of another is an error that names the file (B-01, B-04). The sums are plain
+  SHA-256, so `sha256sum`, `shasum -a 256` or `Get-FileHash` reproduce them. Checkpoints from
+  0.3.0 and earlier still load, with a notice, and get a manifest at their next save.
+- **`germen verify DIR`**: checks every sum, then loads the weights and the optimizer state, and
+  says what is wrong; `germen verify --recover DIR` first finishes or discards a save that was
+  cut off.
+- **A journal for saves.** All temporary files are complete, and `meta.json.tmp` with the manifest
+  exists, before the first rename, so a run killed in the middle of the renames leaves enough to
+  finish the job: `train --resume` and `verify --recover` do (`checkpoint::recover`), and a load
+  that meets such a set is refused with the remedy named (B-04).
+- **`train --overwrite`**, to start from zero in a directory that already holds a checkpoint.
+- A pre-check of the size of the training text against the available memory, before it is read
+  (B-10).
+- SHA-256 with no dependency, **on the processor's SHA instructions** where there are any (x86-64,
+  found at run time; 1.3 GB/s here against 0.2 GB/s for the portable version, as fast as
+  `sha256sum`) and in safe Rust elsewhere. This is the second `unsafe` call of the workspace; it
+  is guarded by differential tests and six mutation proofs.
+- `scripts/audit_fuzz.py` (a hostile-input harness with five suites), `scripts/audit_mutations.py`
+  (26 mutation proofs: put the old defect back and a test must fail) and the black-box scenarios
+  B-01 … B-09 in `scripts/audit_repro.py`.
+- 39 tests: 156 in all. CI's smoke run now also checks `verify`, the refusal of a fresh run over a
+  trained model, and `--overwrite`.
+- API: `checkpoint::{verify, recover, recover_locked, inspect, exists, load_for_resume, FileSum,
+  Verification, Recovery, Inspection}`, `Meta::files`, `TrainOptions::overwrite`,
+  `sys::check_corpus_fits`, `integrity::{Sha256, sha256_hex, file_sum, hex}`.
+
+### Changed
+- **`train` refuses to start from zero in a directory that already holds a checkpoint**, unless
+  `--resume` or `--overwrite` is given (B-06). Scripts that relied on the replacement need
+  `--overwrite`.
+- **`--resume` needs `meta.json`** and refuses an optimizer file that the manifest does not list
+  (B-05); `generate` does not need `meta.json`.
+- The optimizer state is validated before Burn sees it: the parameter ids must be the model's, the
+  shapes equal, and nothing may be silently skipped (B-02, B-03).
+- `config.json` limits: `rope_theta` in [1, 10¹²], `norm_eps` in [10⁻¹², 1] (B-08).
+- `bench` checks `warmup + steps` for overflow and no longer reserves memory for every timing up
+  front (B-09).
+- A 0.4.0 checkpoint can be read by 0.3.0 (the `files` field is ignored there), but 0.3.0 does not
+  verify it.
+
+### Fixed
+- `--tokenizer bpe` scanned quadratically on text without blanks: 5 MB of one letter did not
+  finish in 90 s, and takes 0.2 s now; no token boundary moved (B-07).
+- A damaged `weights.bpk` that still parsed was accepted (B-01); a tensor without a parameter id
+  in `optimizer.bpk` made `--resume` panic (B-02); the optimizer state of another run was accepted
+  (B-03); a set from different saves loaded without a word (B-04); `--resume` without `meta.json`
+  restarted from step 0 over the trained weights (B-05); running `train` twice replaced a trained
+  model (B-06); absurd `norm_eps` and `rope_theta` were accepted (B-08); `bench --steps 2147483648`
+  aborted and `--warmup 18446744073709551615` printed `NaN` (B-09).
+
+### Performance
+Nothing on the training path changed (`bench` on `nano`: 0.52 s against 0.51 s). The price of the
+manifest, on a `base` checkpoint of 1 GB: loading for `generate` costs 0.27 s more (0.34 s →
+0.61 s, with the same peak memory), `germen verify` takes 2.3 s, and the save is not measurably
+slower. With the portable SHA-256 alone `germen verify` of the same checkpoint took 6.5 s.
+
+### Measured and not done
+The `sha2` crate (seven more crates for what is now as fast as `sha256sum`), a `--no-verify` flag,
+hashing the files of a set on several threads (at most 1.5× more) and the ARM SHA instructions
+(no machine to test them on). Details in [docs/AUDIT.md](docs/AUDIT.md).
+
 ## [0.3.0] — 2026-11-17
 
 An adversarial audit of 0.2 and the optimizations it justified. Every finding, how it was

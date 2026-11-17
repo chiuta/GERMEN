@@ -277,6 +277,16 @@ impl Default for BenchReport {
     }
 }
 
+/// How many step times are reserved room for before the first step runs; longer runs grow the
+/// list as they go. The number comes from the command line, and `Vec::with_capacity(steps)`
+/// asks the allocator for all of it at once: `--steps 2147483648` aborted the process (and
+/// `--steps 9223372036854775808` panicked) before a single step had run.
+const MAX_UPFRONT_STEPS: usize = 1 << 16;
+
+fn time_buffer(steps: usize) -> Vec<f64> {
+    Vec::with_capacity(steps.min(MAX_UPFRONT_STEPS))
+}
+
 /// Times `steps` full training steps of `cfg` (after `warmup` untimed ones).
 ///
 /// `name` only labels the result. `replicas` is the number of data-parallel replicas per step
@@ -295,6 +305,12 @@ pub fn bench_model(
     if batch == 0 || steps == 0 {
         return Err("batch și steps trebuie să fie cel puțin 1".into());
     }
+    // In a release build the sum of two huge counts wraps around to a small one: with
+    // `--warmup 18446744073709551615` no step was timed, and the report said "NaN ms/step"
+    // with exit code 0.
+    let total = warmup.checked_add(steps).ok_or_else(|| {
+        format!("warmup ({warmup}) + steps ({steps}) depășește ce se poate număra")
+    })?;
     if seq < 2 || seq > cfg.block_size {
         return Err(format!(
             "seq ({seq}) trebuie să fie între 2 și {}",
@@ -318,8 +334,8 @@ pub fn bench_model(
         .init();
     let mut rng = Rng::new(7);
 
-    let mut times = Vec::with_capacity(steps);
-    for i in 0..warmup + steps {
+    let mut times = time_buffer(steps);
+    for i in 0..total {
         let window = Batch::random(batch, seq, cfg.vocab_size, &mut rng);
         let started = Instant::now();
         let (grads, value) = micro_batch_gradients(&model, &window, replicas, 1, &device)
@@ -408,6 +424,24 @@ pub fn bench_scaling(
 mod tests {
     use super::*;
     use crate::config::Preset;
+
+    #[test]
+    fn counts_that_wrap_or_cannot_be_reserved_are_not_trusted() {
+        // 0.3.0 timed no step at all here (the sum wrapped to 0) and printed NaN with exit code 0.
+        let cfg = Preset::Nano.config(256);
+        let err = bench_model("nano", &cfg, 1, 8, usize::MAX, 1, 1).unwrap_err();
+        assert!(err.contains("warmup") && err.contains("steps"), "{err}");
+        let err = bench_model("nano", &cfg, 1, 8, 2, usize::MAX, 1).unwrap_err();
+        assert!(err.contains("depășește"), "{err}");
+        // The room reserved before the first step is bounded whatever was asked for.
+        for steps in [0, 1, 1 << 20, 1 << 40, usize::MAX / 8, usize::MAX] {
+            let times = time_buffer(steps);
+            assert!(
+                times.capacity() <= MAX_UPFRONT_STEPS.max(times.len()),
+                "{steps}"
+            );
+        }
+    }
 
     #[test]
     fn default_thread_counts_double_up_to_the_maximum() {

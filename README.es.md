@@ -49,9 +49,12 @@ germen generate --model mi-modelo --prompt "Era odată " --max-new 400
 ```
 
 Pulse **Ctrl-C** durante el entrenamiento: termina el paso en curso, guarda y sale. Reanude más
-tarde con el mismo comando más `--resume`: se restauran los pesos, el contador de pasos y el
-estado de AdamW, de modo que el entrenamiento sigue sin el repunte de la pérdida de un reinicio en
-frío (las ventanas de texto se vuelven a sortear).
+tarde con el mismo comando más `--resume`: se restauran los pesos, el contador de pasos y el estado
+de AdamW, de modo que el entrenamiento sigue sin el repunte de la pérdida de un reinicio en frío
+(las ventanas de texto se vuelven a sortear).
+
+El mismo comando `train` lanzado de nuevo *sin* `--resume` se rechaza, para que no sustituya por
+error un modelo entrenado; `--overwrite` lo permite cuando de verdad se quiere empezar de cero.
 
 ## Comandos
 
@@ -62,6 +65,7 @@ frío (las ventanas de texto se vuelven a sortear).
 | `germen demo-corpus` | escribe un corpus rumano sintético generado a partir de una gramática pequeña (`--size-mb`) |
 | `germen train` | entrena desde cero (`--data ARCHIVO` o `--demo`), o continúa con `--resume` |
 | `germen generate` | genera texto con un modelo entrenado, con una caché de claves y valores (`--temperature`, `--top-k`, `--prompt`) |
+| `germen verify` | comprueba un punto de control: el tamaño y el SHA-256 de cada archivo según `meta.json` (lo que imprime `sha256sum`); `--recover` termina un guardado interrumpido, sin necesitar ningún texto |
 
 Opciones de entrenamiento que conviene conocer: `--tokenizer byte|bpe` y `--vocab N` (el tamaño del
 BPE); `--batch` y `--accum` (acumulación de gradientes: el lote efectivo es su producto, la memoria
@@ -152,21 +156,28 @@ crates/germen-cli    la línea de comandos `germen` (clap)
   dos núcleos según el modelo, con un pico de memoria más bajo; `--replicas 1` da el paso
   ordinario). Repartir micro-lotes entre hilos que compartían todos un mismo grafo se probó en la
   0.2 y se descartó; véase [docs/PLAN.md](docs/PLAN.md).
-* **Punto de control** — una carpeta con `config.json`, `weights.bpk` (el formato burnpack de
-  Burn, f32), `optimizer.bpk` (los momentos de AdamW), `tokenizer.json` y `meta.json`. Los puntos
-  de control escritos por la versión 0.1 se siguen cargando.
-* **Pruebas** — 117 pruebas (unitarias de la biblioteca y de la línea de comandos, más ejecuciones
+* **Punto de control** — una carpeta con `config.json`, `weights.bpk` (el formato burnpack de Burn,
+  f32), `optimizer.bpk` (los momentos de AdamW), `tokenizer.json` y `meta.json`. Los puntos de
+  control escritos por la versión 0.1 se siguen cargando. Desde la 0.4, `meta.json` registra también
+  el tamaño y el SHA-256 de los demás archivos, comprobados en cada carga: un archivo dañado,
+  truncado o de otro guardado se nombra en el error; los más antiguos se cargan sin comprobación.
+* **Pruebas** — 156 pruebas (unitarias de la biblioteca y de la línea de comandos, más ejecuciones
   completas del binario real), entre ellas: la atención es causal, la atención por bloques iguala la
   de Burn (valores y gradientes), la generación con caché iguala el paso completo, los micro-lotes
   acumulados equivalen a un lote grande, las réplicas dan los gradientes de un solo grafo grande y
   una ejecución es reproducible bit a bit, un paso de optimización tras recargar el estado de AdamW
   iguala el de un entrenamiento ininterrumpido, un punto de control nunca queda a medio escribir y
   los pesos no finitos nunca se guardan, los archivos hostiles de tokenizador y de configuración se
-  rechazan, toda secuencia de bytes sobrevive al viaje de ida y vuelta por el BPE. La auditoría
-  adversarial está en [docs/AUDIT.md](docs/AUDIT.md).
+  rechazan, toda secuencia de bytes sobrevive al viaje de ida y vuelta por el BPE. Un bit cambiado
+  en un archivo del punto de control se detecta y se nombra el archivo, y un guardado interrumpido
+  en cualquier momento se completa o se descarta. La auditoría adversarial está en
+  [docs/AUDIT.md](docs/AUDIT.md).
 
-## Límites (versión 0.3)
+## Límites (versión 0.4)
 
+* Las sumas de comprobación protegen de los accidentes (un bit cambiado, un archivo truncado,
+  archivos de dos guardados distintos), no de quien también pueda editar `meta.json`; los puntos de
+  control escritos antes de la 0.4 no se pueden verificar.
 * Todo el corpus se lee en memoria (como identificadores de 16 bits); están previstos corpus
   mapeados en memoria, mayores que la RAM.
 * En un solo grafo, algunas operaciones del paso (RMSNorm, embeddings rotatorios, actualización de

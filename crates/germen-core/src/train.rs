@@ -64,6 +64,10 @@ pub struct TrainOptions {
     /// element-wise operations, which do not scale with threads) now run side by side.
     /// `0` chooses automatically, see [`plan_replicas`]; `1` is the ordinary single-graph step.
     pub replicas: usize,
+    /// Allow a run that starts from scratch (no `resume`) to replace a checkpoint that is already
+    /// in the output directory. Without it such a run is refused: its first save would otherwise
+    /// destroy a trained model because `--resume` was forgotten.
+    pub overwrite: bool,
 }
 
 impl Default for TrainOptions {
@@ -86,6 +90,7 @@ impl Default for TrainOptions {
             sample_every: 0,
             seed: 1,
             replicas: 0,
+            overwrite: false,
         }
     }
 }
@@ -233,6 +238,9 @@ pub enum Event<'a> {
         /// Checkpoint directory.
         dir: &'a Path,
     },
+    /// The output directory held the leftovers of a save that was interrupted, which have been
+    /// completed or discarded (see [`checkpoint::recover`]); sent before [`Event::Start`].
+    Recovered(checkpoint::Recovery),
 }
 
 /// Outcome of a training run.
@@ -509,12 +517,27 @@ pub fn train(
     // Held until this function returns: a second run in the same directory would interleave its
     // files with ours into a model that never existed.
     let _claim = DirLock::acquire(out_dir)?;
+    // A save that died half-way is finished (or thrown away) before anything is read from, or
+    // refused because of, what the directory holds.
+    match checkpoint::recover(out_dir)? {
+        checkpoint::Recovery::Nothing => {}
+        recovery => on_event(Event::Recovered(recovery)),
+    }
+    if !resume && !opts.overwrite && checkpoint::exists(out_dir) {
+        let step = checkpoint::load_meta(out_dir).map(|m| m.step).unwrap_or(0);
+        return Err(format!(
+            "{} conține deja un punct de control (pasul {step}); o antrenare nouă l-ar înlocui la \
+             prima salvare. Continuați-l cu --resume, alegeți alt --out sau adăugați --overwrite \
+             dacă vreți să-l înlocuiți",
+            out_dir.display()
+        ));
+    }
 
     let device = crate::train_device();
     let eval_device = device.clone().without_autodiff();
 
     let (mut model, mut meta) = if resume {
-        let (m, saved_cfg, meta) = checkpoint::load(out_dir, &device)?;
+        let (m, saved_cfg, meta) = checkpoint::load_for_resume(out_dir, &device)?;
         let same = serde_json::to_string(&saved_cfg).ok() == serde_json::to_string(cfg).ok();
         if !same {
             return Err("arhitectura din punctul de control diferă de cea cerută; \
@@ -561,7 +584,7 @@ pub fn train(
         .init();
     let mut optimizer_restored = false;
     if resume {
-        (optim, optimizer_restored) = checkpoint::load_optimizer(out_dir, optim)?;
+        (optim, optimizer_restored) = checkpoint::load_optimizer(out_dir, optim, &model)?;
     }
 
     on_event(Event::Start {
@@ -860,6 +883,162 @@ mod tests {
             .validate(&cfg)
             .is_ok()
         );
+    }
+
+    /// A scratch directory name that no other test (or run of the suite) uses.
+    fn scratch(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("germen-train-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
+
+    /// Tiny corpus, model and options for the tests of how a run treats its directory.
+    fn small_run(steps: usize) -> (Corpus, GptConfig, TrainOptions) {
+        let corpus = Corpus::from_bytes(demo_corpus(20_000, 5).into_bytes(), 0.1).unwrap();
+        let cfg = Preset::Nano.config(32);
+        let opts = TrainOptions {
+            steps,
+            batch: 2,
+            seq: 32,
+            warmup: 1,
+            eval_every: 0,
+            save_every: 0,
+            log_every: 1,
+            ..TrainOptions::default()
+        };
+        (corpus, cfg, opts)
+    }
+
+    #[test]
+    fn a_fresh_run_does_not_silently_replace_a_trained_checkpoint() {
+        // The commonest slip: running the same command again without --resume. Until 0.4.0 the
+        // first save of the second run replaced the trained model without a word.
+        let dir = scratch("no-clobber");
+        let (corpus, cfg, opts) = small_run(3);
+        let stop = AtomicBool::new(false);
+        train(&corpus, &cfg, &opts, &dir, false, &stop, &mut |_| {}).unwrap();
+        let weights = dir.join(checkpoint::WEIGHTS_FILE);
+        let before = std::fs::read(&weights).unwrap();
+
+        let err = train(&corpus, &cfg, &opts, &dir, false, &stop, &mut |_| {}).unwrap_err();
+        assert!(
+            err.contains("--resume") && err.contains("--overwrite"),
+            "{err}"
+        );
+        assert!(err.contains("pasul 3"), "{err}");
+        assert_eq!(
+            std::fs::read(&weights).unwrap(),
+            before,
+            "not a byte changed"
+        );
+
+        // Asking for it is allowed.
+        let again = TrainOptions {
+            overwrite: true,
+            seed: 2,
+            ..opts.clone()
+        };
+        train(&corpus, &cfg, &again, &dir, false, &stop, &mut |_| {}).unwrap();
+        assert_ne!(std::fs::read(&weights).unwrap(), before);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resume_without_the_progress_record_is_refused_not_restarted_from_zero() {
+        // With meta.json gone, `--resume` used to carry on from step 0 on the trained weights:
+        // warm-up again, statistics wiped, "untrained model" announced, and the next save
+        // recorded the mixture as the checkpoint.
+        let dir = scratch("no-meta");
+        let (corpus, cfg, opts) = small_run(3);
+        let stop = AtomicBool::new(false);
+        train(&corpus, &cfg, &opts, &dir, false, &stop, &mut |_| {}).unwrap();
+        std::fs::remove_file(dir.join(checkpoint::META_FILE)).unwrap();
+        let weights = std::fs::read(dir.join(checkpoint::WEIGHTS_FILE)).unwrap();
+
+        let more = TrainOptions { steps: 5, ..opts };
+        let err = train(&corpus, &cfg, &more, &dir, true, &stop, &mut |_| {}).unwrap_err();
+        assert!(err.contains("meta.json"), "{err}");
+        assert_eq!(
+            std::fs::read(dir.join(checkpoint::WEIGHTS_FILE)).unwrap(),
+            weights
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resume_refuses_files_of_two_different_saves() {
+        // The optimizer of step 3 next to the weights of step 5: both intact, neither complaining.
+        let (a, b) = (scratch("mix-a"), scratch("mix-b"));
+        let (corpus, cfg, opts) = small_run(3);
+        let stop = AtomicBool::new(false);
+        train(&corpus, &cfg, &opts, &a, false, &stop, &mut |_| {}).unwrap();
+        for entry in std::fs::read_dir(&a).unwrap() {
+            let entry = entry.unwrap();
+            std::fs::create_dir_all(&b).unwrap();
+            std::fs::copy(entry.path(), b.join(entry.file_name())).unwrap();
+        }
+        let more = TrainOptions {
+            steps: 5,
+            ..opts.clone()
+        };
+        train(&corpus, &cfg, &more, &b, true, &stop, &mut |_| {}).unwrap();
+
+        std::fs::copy(
+            b.join(checkpoint::OPTIMIZER_FILE),
+            a.join(checkpoint::OPTIMIZER_FILE),
+        )
+        .unwrap();
+        let err = train(&corpus, &cfg, &more, &a, true, &stop, &mut |_| {}).unwrap_err();
+        assert!(err.contains(checkpoint::OPTIMIZER_FILE), "{err}");
+        let _ = std::fs::remove_dir_all(&a);
+        let _ = std::fs::remove_dir_all(&b);
+    }
+
+    #[test]
+    fn resume_completes_a_save_that_was_cut_short() {
+        // A run that died after writing every file of step 5 but before publishing any of them:
+        // the next `--resume` must finish that save, not silently go back to step 3.
+        let (a, b) = (scratch("cut-a"), scratch("cut-b"));
+        let (corpus, cfg, opts) = small_run(3);
+        let stop = AtomicBool::new(false);
+        train(&corpus, &cfg, &opts, &a, false, &stop, &mut |_| {}).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+        for entry in std::fs::read_dir(&a).unwrap() {
+            let entry = entry.unwrap();
+            std::fs::copy(entry.path(), b.join(entry.file_name())).unwrap();
+        }
+        let more = TrainOptions {
+            steps: 5,
+            ..opts.clone()
+        };
+        train(&corpus, &cfg, &more, &b, true, &stop, &mut |_| {}).unwrap();
+        for name in [
+            "tokenizer.json",
+            "optimizer.bpk",
+            "weights.bpk",
+            "config.json",
+            "meta.json",
+        ] {
+            let tmp = crate::fsutil::tmp_path(&a.join(name));
+            std::fs::copy(b.join(name), tmp).unwrap();
+        }
+
+        let mut recovered = None;
+        let report = train(&corpus, &cfg, &more, &a, true, &stop, &mut |e| {
+            if let Event::Recovered(r) = e {
+                recovered = Some(r);
+            }
+        })
+        .unwrap();
+        assert_eq!(recovered, Some(checkpoint::Recovery::Completed(5)));
+        assert_eq!(report.final_step, 5);
+        assert_eq!(report.steps_run, 0, "step 5 was already on disk");
+        assert_eq!(
+            std::fs::read(a.join(checkpoint::WEIGHTS_FILE)).unwrap(),
+            std::fs::read(b.join(checkpoint::WEIGHTS_FILE)).unwrap()
+        );
+        let _ = std::fs::remove_dir_all(&a);
+        let _ = std::fs::remove_dir_all(&b);
     }
 
     #[test]
@@ -1543,7 +1722,7 @@ mod tests {
         // C: reload the weights only (what GERMEN 0.1 did).
         let a = step(model, &mut optim, 3);
         let (mb, _, _) = checkpoint::load(&dir, &device).unwrap();
-        let (mut ob, found) = checkpoint::load_optimizer(&dir, adam()).unwrap();
+        let (mut ob, found) = checkpoint::load_optimizer(&dir, adam(), &mb).unwrap();
         assert!(found);
         let b = step(mb, &mut ob, 3);
         let (mc, _, _) = checkpoint::load(&dir, &device).unwrap();

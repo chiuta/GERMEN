@@ -144,9 +144,11 @@ impl Tokenizer {
     }
 
     /// Reads the tokenizer stored in `dir`. A directory without `tokenizer.json` (every
-    /// checkpoint from before GERMEN 0.2) means the byte tokenizer.
+    /// checkpoint from before GERMEN 0.2) means the byte tokenizer, unless the checkpoint's
+    /// `meta.json` lists the file: then it must be there, and unchanged.
     pub fn load(dir: &Path) -> Result<Tokenizer, String> {
         let path = dir.join(TOKENIZER_FILE);
+        crate::checkpoint::verify_files(dir, &[TOKENIZER_FILE])?;
         if !path.exists() {
             return Ok(Tokenizer::Byte);
         }

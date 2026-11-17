@@ -163,7 +163,7 @@ def _(binary, tag):
 
 @scenario("A-04n SIGKILL x25 during back-to-back saves", "Info")
 def _(binary, tag):
-    bad, trials = 0, 25
+    bad, torn, trials = 0, 0, 25
     rnd = random.Random(12345)
     for i in range(trials):
         d = scratch("kill%d" % i, tag)
@@ -179,9 +179,23 @@ def _(binary, tag):
         p.wait()
         rc, out, _ = run(binary, ["generate", "--model", d, "--max-new", "3", "--seed", "1"], timeout=60)
         if rc != 0:
-            bad += 1
+            # Since 0.4.0 a set cut off between two renames is refused instead of being loaded as a
+            # mixture; `--resume` completes it (or throws away a half-written one), after which
+            # the checkpoint must load. That is not a failure; a checkpoint that stays broken is.
+            torn += 1
+            try:
+                step = json.load(open(d + "/meta.json"))["step"]
+            except Exception:
+                step = 0
+            run(binary, ["train", "--demo", "--demo-mb", "0.1", "--preset", "nano", "--seq", "16", "--batch", "1",
+                         "--steps", str(step + 1), "--save-every", "0", "--eval-every", "100000",
+                         "--eval-batches", "1", "--log-every", "100000", "--out", d, "--resume"], timeout=120)
+            rc, out, _ = run(binary, ["generate", "--model", d, "--max-new", "3", "--seed", "1"], timeout=60)
+            if rc != 0:
+                bad += 1
         shutil.rmtree(d, ignore_errors=True)
-    return bad == 0, "%d of %d killed runs left a checkpoint that does not load (negative result for both)" % (bad, trials)
+    return bad == 0, ("%d of %d killed runs left a checkpoint that cannot be loaded or recovered; %d needed "
+                      "`--resume` to finish a cut-off save (negative result for both)" % (bad, trials, torn))
 
 
 @scenario("A-05 a diverged model is written over the checkpoint", "High")
@@ -316,6 +330,151 @@ def _(binary, tag):
         p.wait()
         dt = 999
     return dt < 5, "exited %.1fs after Ctrl-C" % dt
+
+
+# --------------------------------------------------------------------------------------------
+# Round 2: the same method applied to GERMEN 0.3.0. "old" is a 0.3.0 binary, "new" a 0.4.0 one.
+# --------------------------------------------------------------------------------------------
+
+
+def strip_manifest(d):
+    """Makes a checkpoint look like one written by 0.3.0 or before: no `files` in meta.json. The
+    structural checks, not the checksums, are then what a scenario exercises."""
+    path = os.path.join(d, "meta.json")
+    meta = json.load(open(path))
+    meta.pop("files", None)
+    json.dump(meta, open(path, "w"))
+
+
+def resume_tiny(binary, d, steps=40):
+    i = TINY.index("--steps")
+    return run(binary, ["train", *TINY[:i], "--steps", str(steps), *TINY[i + 2:], "--out", d, "--resume"], timeout=120)
+
+
+def last_line(out):
+    lines = out.strip().splitlines()
+    return lines[-1][:110] if lines else ""
+
+
+@scenario("B-01 one flipped bit in weights.bpk is accepted", "Medium")
+def _(binary, tag):
+    d = scratch("bitflip", tag)
+    train_tiny(binary, d)
+    path = d + "/weights.bpk"
+    data = bytearray(open(path, "rb").read())
+    pos = (len(data) // 2) & ~3  # the low byte of a 32-bit weight, deep inside the tensor data
+    data[pos] ^= 1
+    open(path, "wb").write(bytes(data))
+    rc, out, _ = run(binary, ["generate", "--model", d, "--max-new", "20", "--seed", "1"], timeout=60)
+    return clean_refusal(rc, out), "exit %s: %s" % (rc, last_line(out))
+
+
+@scenario("B-02 a renamed key in optimizer.bpk makes --resume panic", "Low")
+def _(binary, tag):
+    d = scratch("optkey", tag)
+    train_tiny(binary, d)
+    strip_manifest(d)  # the loader's own structural checks are what is tested, not the checksum
+    path = d + "/optimizer.bpk"
+    b = bytearray(open(path, "rb").read())
+    i = b.find(b"param_id")
+    assert i > 0, "no param_id key in optimizer.bpk"
+    b[i + 7] ^= 1  # param_id -> param_ie: a tensor without a parameter id
+    open(path, "wb").write(bytes(b))
+    rc, out, _ = resume_tiny(binary, d)
+    return clean_refusal(rc, out), "exit %s: %s" % (rc, last_line(out))
+
+
+@scenario("B-03 --resume with the optimizer state of another run", "Medium")
+def _(binary, tag):
+    a, b = scratch("foreignA", tag), scratch("foreignB", tag)
+    train_tiny(binary, a)
+    train_tiny(binary, b, ["--seed", "7"])
+    shutil.copy(b + "/optimizer.bpk", a + "/optimizer.bpk")
+    ok, notes = True, []
+    for label, strip in (("checksums", False), ("no checksums", True)):
+        d = scratch("foreign_" + label.split()[0], tag)
+        shutil.copytree(a, d)
+        if strip:
+            strip_manifest(d)
+        rc, out, _ = resume_tiny(binary, d)
+        ok &= clean_refusal(rc, out)
+        notes.append("%s: exit %s" % (label, rc))
+    return ok, "; ".join(notes)
+
+
+@scenario("B-04 weights.bpk of one run next to the meta.json of another", "Medium")
+def _(binary, tag):
+    a, b = scratch("mixA", tag), scratch("mixB", tag)
+    train_tiny(binary, a)
+    train_tiny(binary, b, ["--seed", "7"])
+    shutil.copy(b + "/weights.bpk", a + "/weights.bpk")
+    rc, out, _ = run(binary, ["generate", "--model", a, "--max-new", "20", "--seed", "1"], timeout=60)
+    return clean_refusal(rc, out), "exit %s: %s" % (rc, last_line(out))
+
+
+@scenario("B-05 --resume without meta.json starts again from step 0", "Medium")
+def _(binary, tag):
+    d = scratch("nometa", tag)
+    train_tiny(binary, d)
+    before = open(d + "/weights.bpk", "rb").read()
+    os.remove(d + "/meta.json")
+    rc, out, _ = resume_tiny(binary, d)
+    same = open(d + "/weights.bpk", "rb").read() == before
+    return clean_refusal(rc, out) and same, "exit %s; weights %s" % (rc, "untouched" if same else "OVERWRITTEN")
+
+
+@scenario("B-06 the same train command again replaces a trained checkpoint", "Medium")
+def _(binary, tag):
+    d = scratch("again", tag)
+    train_tiny(binary, d)
+    before = open(d + "/weights.bpk", "rb").read()
+    rc, out, _ = run(binary, ["train", *TINY, "--seed", "99", "--out", d], timeout=120)
+    same = open(d + "/weights.bpk", "rb").read() == before
+    return clean_refusal(rc, out) and same, "exit %s; trained weights %s" % (rc, "kept" if same else "REPLACED")
+
+
+@scenario("B-07 --tokenizer bpe on 5 MB without a blank", "Low")
+def _(binary, tag):
+    text = os.path.join(ROOT, "five-megabytes-of-a.txt")
+    if not os.path.exists(text):
+        os.makedirs(ROOT, exist_ok=True)
+        open(text, "wb").write(b"a" * 5_000_000)
+    d = scratch("bpe5", tag)
+    rc, out, dt = run(binary, ["train", "--data", text, "--tokenizer", "bpe", "--vocab", "300", "--preset", "nano",
+                               "--seq", "32", "--batch", "2", "--steps", "1", "--eval-every", "0", "--out", d],
+                      timeout=90)
+    return rc == 0 and dt < 45, "exit %s after %.1fs" % (rc, dt)
+
+
+@scenario("B-08 config.json with norm_eps 1e-300 or rope_theta 0.5", "Low")
+def _(binary, tag):
+    base = scratch("cfg-base", tag)
+    train_tiny(binary, base)
+    strip_manifest(base)
+    ok, notes = True, []
+    for field, value in (("norm_eps", 1e-300), ("norm_eps", 1e300), ("rope_theta", 0.5), ("rope_theta", 1e30)):
+        d = scratch("cfg-%s-%g" % (field, value), tag)
+        shutil.copytree(base, d)
+        cfg = json.load(open(d + "/config.json"))
+        cfg[field] = value
+        json.dump(cfg, open(d + "/config.json", "w"))
+        rc, out, _ = run(binary, ["generate", "--model", d, "--max-new", "5", "--seed", "1"], timeout=60)
+        ok &= clean_refusal(rc, out)
+        notes.append("%s=%g: exit %s" % (field, value, rc))
+    return ok, "; ".join(notes)
+
+
+@scenario("B-09 bench --warmup 18446744073709551615 / --steps 2147483648", "Low")
+def _(binary, tag):
+    bench = ["bench", "--preset", "nano", "--batch", "2", "--seq", "32", "--threads", "1"]
+    rc1, out1, _ = run(binary, [*bench, "--steps", "1", "--warmup", "18446744073709551615"], timeout=30)
+    # A refusal is right; a report of "NaN ms/step" with exit 0 is the bug.
+    ok1 = clean_refusal(rc1, out1) and "NaN" not in out1
+    rc2, out2, _ = run(binary, [*bench, "--steps", "2147483648", "--warmup", "0"], timeout=8)
+    # Still running after 8 s is fine (a benchmark of two billion steps is simply long); an abort or a
+    # panic before the first step is the bug.
+    ok2 = rc2 == "timeout" or clean_refusal(rc2, out2)
+    return ok1 and ok2, "warmup: exit %s%s; steps: exit %s" % (rc1, " (NaN printed)" if "NaN" in out1 else "", rc2)
 
 
 def summary():

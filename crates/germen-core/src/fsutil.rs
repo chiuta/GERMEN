@@ -37,7 +37,7 @@ fn sync_file(path: &Path) -> Result<(), String> {
 
 /// Makes the renames inside `dir` durable too (the directory entry is data of the directory).
 #[cfg(unix)]
-fn sync_dir(dir: &Path) {
+pub(crate) fn sync_dir(dir: &Path) {
     if let Ok(d) = File::open(dir) {
         let _ = d.sync_all();
     }
@@ -45,7 +45,7 @@ fn sync_dir(dir: &Path) {
 
 /// Windows cannot flush a directory handle; NTFS journals the renames itself.
 #[cfg(not(unix))]
-fn sync_dir(_dir: &Path) {}
+pub(crate) fn sync_dir(_dir: &Path) {}
 
 /// Calls `op` until it succeeds, retrying up to `attempts` times in total while `transient` says
 /// the error may go away, and waiting `first_delay`, then twice that, and so on, in between.
@@ -104,8 +104,10 @@ pub(crate) fn rename_over(from: &Path, to: &Path) -> Result<(), String> {
 /// into place, in the order they were added, so the file that decides what the others mean (the
 /// checkpoint's `meta.json`) goes last. A run that dies while writing (the long part: hundreds of
 /// MB for a big model) leaves the previous checkpoint exactly as it was; the window in which
-/// new and old files can be mixed shrinks to a handful of renames. Dropping a `Staged` that was
-/// not committed deletes its temporary files.
+/// new and old files can be mixed shrinks to a handful of renames, and a run that dies inside it
+/// leaves every remaining file complete under its temporary name, which is what
+/// [`crate::checkpoint::recover`] finishes the set from. Dropping a `Staged` that was not
+/// committed deletes its temporary files.
 pub(crate) struct Staged {
     dir: PathBuf,
     /// `(temporary name, final name)` of every file added so far.
@@ -120,6 +122,11 @@ impl Staged {
             dir: dir.to_path_buf(),
             pending: Vec::new(),
         })
+    }
+
+    /// Where the file `name` of this set is written before it is renamed into place.
+    pub(crate) fn tmp_of(&self, name: &str) -> PathBuf {
+        tmp_path(&self.dir.join(name))
     }
 
     /// Adds the file `name` with the given content.
@@ -144,15 +151,29 @@ impl Staged {
         sync_file(&tmp)
     }
 
-    /// Renames every file into place. On an error the files not yet renamed are deleted.
+    /// Renames every file into place.
+    ///
+    /// If the very first rename fails nothing has been published, so the staged files are deleted
+    /// and the previous ones are exactly as they were. If a later one fails, the set is half
+    /// published; the files not yet renamed are then *kept* under their temporary names, because
+    /// they are the only way to finish the set (see [`crate::checkpoint::recover`]), and the error
+    /// says so.
     pub(crate) fn commit(mut self) -> Result<(), String> {
         let pending = std::mem::take(&mut self.pending);
         for (i, (tmp, target)) in pending.iter().enumerate() {
             if let Err(e) = rename_over(tmp, target) {
-                for (rest, _) in &pending[i..] {
-                    let _ = fs::remove_file(rest);
+                if i == 0 {
+                    for (rest, _) in &pending {
+                        let _ = fs::remove_file(rest);
+                    }
+                    return Err(e);
                 }
-                return Err(e);
+                return Err(format!(
+                    "{e}; setul a rămas publicat doar în parte ({i} din {} fișiere), iar restul \
+                     au rămas ca *.tmp: la următoarea pornire cu --resume salvarea se termină \
+                     singură",
+                    pending.len()
+                ));
             }
         }
         sync_dir(&self.dir);
@@ -287,7 +308,8 @@ mod tests {
     fn files_are_published_in_order_so_a_failure_never_reaches_the_last_one() {
         // The checkpoint's meta.json is staged last. If publishing stops half-way (here: the
         // second file cannot be replaced because a directory sits in its place), the last file
-        // must still be the old one, and no temporary file may stay behind.
+        // must still be the old one, and the files that were not published must stay, complete,
+        // under their temporary names: they are what a later run finishes the set from.
         let dir = scratch("order");
         fs::create_dir_all(dir.join("blocked")).unwrap();
         fs::write(dir.join("blocked").join("inside"), "x").unwrap();
@@ -298,16 +320,39 @@ mod tests {
         staged.bytes("first", b"new first").unwrap();
         staged.bytes("blocked", b"new blocked").unwrap();
         staged.bytes("meta", b"new meta").unwrap();
-        assert!(staged.commit().is_err());
+        let err = staged.commit().unwrap_err();
+        assert!(err.contains("1 din 3"), "{err}");
 
         assert_eq!(fs::read_to_string(dir.join("first")).unwrap(), "new first");
         assert_eq!(fs::read_to_string(dir.join("meta")).unwrap(), "old meta");
         assert!(dir.join("blocked").is_dir());
         assert_eq!(
-            names(&dir),
-            ["blocked", "first", "meta"],
-            "no .tmp left over"
+            fs::read_to_string(dir.join("meta.tmp")).unwrap(),
+            "new meta",
+            "the unpublished files stay, complete"
         );
+        assert_eq!(
+            names(&dir),
+            ["blocked", "blocked.tmp", "first", "meta", "meta.tmp"]
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_failure_at_the_first_file_publishes_nothing_and_leaves_nothing() {
+        // Nothing has been published yet, so there is no half-set to finish: the staged files
+        // are dropped and the old ones are exactly as they were.
+        let dir = scratch("first-fails");
+        fs::create_dir_all(dir.join("blocked")).unwrap();
+        fs::write(dir.join("blocked").join("inside"), "x").unwrap();
+        fs::write(dir.join("meta"), "old meta").unwrap();
+
+        let mut staged = Staged::new(&dir).unwrap();
+        staged.bytes("blocked", b"new blocked").unwrap();
+        staged.bytes("meta", b"new meta").unwrap();
+        assert!(staged.commit().is_err());
+        assert_eq!(fs::read_to_string(dir.join("meta")).unwrap(), "old meta");
+        assert_eq!(names(&dir), ["blocked", "meta"], "no .tmp left over");
         let _ = fs::remove_dir_all(&dir);
     }
 

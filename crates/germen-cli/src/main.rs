@@ -1,6 +1,6 @@
 //! `germen` — command-line front end of GERMEN.
 //!
-//! Subcommands: `info`, `bench`, `demo-corpus`, `train`, `generate`.
+//! Subcommands: `info`, `bench`, `demo-corpus`, `train`, `generate`, `verify`.
 #![deny(unsafe_code)]
 
 use clap::{Args, Parser, Subcommand};
@@ -49,6 +49,18 @@ enum Command {
     Train(TrainArgs),
     /// Generează text cu un model antrenat
     Generate(GenerateArgs),
+    /// Verifică un punct de control: sumele SHA-256 din meta.json, ponderile, optimizatorul
+    Verify(VerifyArgs),
+}
+
+#[derive(Args)]
+struct VerifyArgs {
+    /// Directorul punctului de control
+    #[arg(default_value = "germen-model")]
+    dir: PathBuf,
+    /// Termină (sau aruncă) o salvare întreruptă înainte de verificare; nu are nevoie de text
+    #[arg(long)]
+    recover: bool,
 }
 
 #[derive(Args)]
@@ -190,8 +202,13 @@ struct TrainArgs {
     #[arg(long, default_value_t = 0.05)]
     val_fraction: f64,
     /// Continuă din punctul de control din --out
-    #[arg(long)]
+    #[arg(long, conflicts_with = "overwrite")]
     resume: bool,
+    /// Începe de la zero chiar dacă --out conține deja un punct de control (îl înlocuiește la
+    /// prima salvare). Fără această opțiune, o rulare nouă într-un director cu model antrenat e
+    /// refuzată, ca să nu-l pierdeți dacă uitați --resume
+    #[arg(long)]
+    overwrite: bool,
 }
 
 #[derive(Args)]
@@ -240,6 +257,7 @@ fn main() -> ExitCode {
         Command::DemoCorpus(a) => cmd_demo(a),
         Command::Train(a) => cmd_train(a),
         Command::Generate(a) => cmd_generate(a),
+        Command::Verify(a) => cmd_verify(a),
     })
     .and_then(|r| r);
     match result {
@@ -250,6 +268,11 @@ fn main() -> ExitCode {
         }
     }
 }
+
+/// Said when a checkpoint has no manifest of SHA-256 sums to be checked against.
+const NO_MANIFEST_NOTE: &str = "notă: punctul de control nu are sume de control (e scris de GERMEN \
+     înainte de 0.4.0), deci integritatea lui nu poate fi verificată; următoarea salvare îi adaugă un \
+     manifest.";
 
 fn parse_preset(name: &str) -> Result<Preset, String> {
     Preset::parse(name).ok_or_else(|| {
@@ -473,6 +496,18 @@ fn cmd_train(a: TrainArgs) -> Result<(), String> {
     // Text.
     let text: Vec<u8> = match (&a.data, a.demo) {
         (Some(path), false) => {
+            // A text that cannot fit is refused before it is read: reading it may well succeed,
+            // and it is the tokens that then do not fit (the allocator would abort the process).
+            if let Ok(info) = std::fs::metadata(path)
+                && info.is_file()
+            {
+                let per_byte = if a.tokenizer == "bpe" && !a.resume {
+                    2
+                } else {
+                    3
+                };
+                sys::check_corpus_fits(info.len(), per_byte)?;
+            }
             std::fs::read(path).map_err(|e| format!("nu pot citi {}: {e}", path.display()))?
         }
         (None, true) => {
@@ -484,6 +519,11 @@ fn cmd_train(a: TrainArgs) -> Result<(), String> {
     // Tokenizer: the saved one when resuming, otherwise as requested (BPE is learned from the
     // training part of the text only).
     let tokenizer = if a.resume {
+        if a.out.join(checkpoint::META_FILE).exists()
+            && checkpoint::load_meta(&a.out)?.files.is_empty()
+        {
+            eprintln!("{NO_MANIFEST_NOTE}");
+        }
         let t = Tokenizer::load(&a.out)?;
         if t.name() != a.tokenizer && a.tokenizer != "byte" {
             eprintln!(
@@ -555,6 +595,7 @@ fn cmd_train(a: TrainArgs) -> Result<(), String> {
         sample_every: a.sample_every,
         seed: a.seed,
         replicas: a.replicas,
+        overwrite: a.overwrite,
     };
 
     // Ctrl-C: finish the current step, save, exit. A second Ctrl-C quits at once.
@@ -686,6 +727,8 @@ fn cmd_train(a: TrainArgs) -> Result<(), String> {
                     dir.display()
                 );
             }
+            Event::Recovered(checkpoint::Recovery::Nothing) => {}
+            Event::Recovered(found) => println!("{}", recovery_message(&found)),
         },
     )?;
 
@@ -722,9 +765,58 @@ fn cmd_train(a: TrainArgs) -> Result<(), String> {
     Ok(())
 }
 
+/// What `--resume` and `verify --recover` say about an interrupted save they dealt with.
+fn recovery_message(found: &checkpoint::Recovery) -> String {
+    match found {
+        checkpoint::Recovery::Completed(files) => format!(
+            "Recuperare: o salvare anterioară fusese întreruptă după ce își scrisese toate \
+             fișierele; am terminat-o ({files} fișiere publicate)."
+        ),
+        checkpoint::Recovery::Discarded(files) => format!(
+            "Recuperare: o salvare anterioară fusese întreruptă în timp ce scria; am șters \
+             cele {files} fișiere neterminate, iar punctul de control vechi e intact."
+        ),
+        checkpoint::Recovery::Nothing => "Nicio salvare întreruptă de terminat.".to_string(),
+    }
+}
+
+fn cmd_verify(a: VerifyArgs) -> Result<(), String> {
+    if a.recover {
+        println!("{}", recovery_message(&checkpoint::recover_locked(&a.dir)?));
+    }
+    let found = checkpoint::inspect(&a.dir)?;
+    println!(
+        "{}: punct de control întreg, la pasul {} ({:.2}M parametri).",
+        a.dir.display(),
+        found.meta.step,
+        found.config.num_params() as f64 / 1e6
+    );
+    for (name, bytes) in &found.files {
+        println!("  {name:<15} {bytes:>12} octeți  SHA-256 corect");
+    }
+    println!(
+        "  {:<15} {}",
+        "optimizator",
+        if found.optimizer {
+            "starea AdamW aparține acestor ponderi"
+        } else {
+            "lipsește (se pornește de la zero la --resume)"
+        }
+    );
+    for name in &found.leftovers {
+        println!(
+            "  atenție: {name} e rămas dintr-o salvare întreruptă; `germen train --resume` o termină"
+        );
+    }
+    Ok(())
+}
+
 fn cmd_generate(a: GenerateArgs) -> Result<(), String> {
     let device = germen_core::cpu_device();
     let (model, cfg, meta) = checkpoint::load(&a.model, &device)?;
+    if meta.files.is_empty() {
+        eprintln!("{NO_MANIFEST_NOTE}");
+    }
     let tokenizer = Tokenizer::load(&a.model)?;
     if tokenizer.vocab_size() != cfg.vocab_size {
         return Err(format!(

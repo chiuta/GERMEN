@@ -3244,7 +3244,7 @@ dependencies = [
 
 [[package]]
 name = "germen-cli"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "clap",
  "ctrlc",
@@ -3254,9 +3254,10 @@ dependencies = [
 
 [[package]]
 name = "germen-core"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "burn",
+ "burn-pack",
  "rayon",
  "serde",
  "serde_json",

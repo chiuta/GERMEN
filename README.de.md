@@ -54,6 +54,10 @@ beendet sich. Setzen Sie später mit demselben Befehl plus `--resume` fort: Gewi
 und AdamW-Zustand werden wiederhergestellt, sodass das Training ohne den Verlustsprung eines
 Kaltstarts weitergeht (die Textfenster werden neu gezogen).
 
+Derselbe `train`-Befehl, erneut *ohne* `--resume` ausgeführt, wird abgelehnt, damit er nicht
+versehentlich ein trainiertes Modell ersetzt; `--overwrite` erlaubt es, wenn man absichtlich neu
+beginnen will.
+
 ## Befehle
 
 | Befehl | was er tut |
@@ -63,6 +67,7 @@ Kaltstarts weitergeht (die Textfenster werden neu gezogen).
 | `germen demo-corpus` | schreibt einen synthetischen rumänischen Korpus, erzeugt aus einer kleinen Grammatik (`--size-mb`) |
 | `germen train` | trainiert von Grund auf (`--data DATEI` oder `--demo`) oder macht mit `--resume` weiter |
 | `germen generate` | erzeugt Text aus einem trainierten Modell, mit Key-Value-Cache (`--temperature`, `--top-k`, `--prompt`) |
+| `germen verify` | prüft einen Checkpoint: Größe und SHA-256 jeder Datei gegen `meta.json` (was `sha256sum` ausgibt); `--recover` schließt ein unterbrochenes Speichern ab, ganz ohne Text |
 
 Wissenswerte Trainingsoptionen: `--tokenizer byte|bpe` und `--vocab N` (die BPE-Größe); `--batch`
 und `--accum` (Gradientenakkumulation: Der effektive Batch ist ihr Produkt, der Speicher entspricht
@@ -155,8 +160,11 @@ crates/germen-cli    die Kommandozeile `germen` (clap)
   teilten, wurde in 0.2 versucht und verworfen; siehe [docs/PLAN.md](docs/PLAN.md).
 * **Checkpoint** — ein Ordner mit `config.json`, `weights.bpk` (Burns Burnpack-Format, f32),
   `optimizer.bpk` (die AdamW-Momente), `tokenizer.json` und `meta.json`. Von Version 0.1
-  geschriebene Checkpoints lassen sich weiterhin laden.
-* **Tests** — 117 Tests (Unit-Tests der Bibliothek und der Kommandozeile sowie vollständige Läufe
+  geschriebene Checkpoints lassen sich weiterhin laden. Seit 0.4 hält `meta.json` auch Größe und
+  SHA-256 der übrigen Dateien fest, bei jedem Laden geprüft: Eine beschädigte, abgeschnittene oder
+  aus einem anderen Speicherstand stammende Datei wird in der Fehlermeldung genannt; ältere
+  Checkpoints laden ungeprüft.
+* **Tests** — 156 Tests (Unit-Tests der Bibliothek und der Kommandozeile sowie vollständige Läufe
   des echten Binärprogramms), darunter: Die Attention ist kausal, die blockweise Attention gleicht
   der von Burn (Werte und Gradienten), die Generierung mit Cache gleicht dem vollständigen
   Durchlauf, akkumulierte Mikro-Batches entsprechen einem großen Batch, Replikate liefern die
@@ -164,11 +172,15 @@ crates/germen-cli    die Kommandozeile `germen` (clap)
   Optimierungsschritt nach dem Neuladen des AdamW-Zustands gleicht dem eines ununterbrochenen
   Trainings, ein Checkpoint bleibt nie halb geschrieben und nicht endliche Gewichte werden nie
   gespeichert, feindliche Tokenizer- und Konfigurationsdateien werden abgelehnt, jede Bytefolge
-  übersteht den Hin-und-Rück-Weg durch das BPE. Das adversariale Audit steht in
-  [docs/AUDIT.md](docs/AUDIT.md).
+  übersteht den Hin-und-Rück-Weg durch das BPE. Ein gekipptes Bit in einer Checkpoint-Datei wird
+  erkannt und die Datei benannt, und ein zu jedem Zeitpunkt unterbrochenes Speichern wird
+  abgeschlossen oder verworfen. Das adversariale Audit steht in [docs/AUDIT.md](docs/AUDIT.md).
 
-## Grenzen (Version 0.3)
+## Grenzen (Version 0.4)
 
+* Die Prüfsummen schützen vor Unfällen (ein gekipptes Bit, eine abgeschnittene Datei, Dateien aus
+  zwei verschiedenen Speicherständen), nicht vor jemandem, der auch `meta.json` ändern kann; vor 0.4
+  geschriebene Checkpoints lassen sich nicht prüfen.
 * Der gesamte Korpus wird in den Speicher gelesen (als 16-Bit-Kennungen); speicherabgebildete
   Korpora, die größer als der Arbeitsspeicher sind, sind geplant.
 * In einem einzelnen Graphen nutzen einige Operationen des Schritts (RMSNorm, rotierende Embeddings,

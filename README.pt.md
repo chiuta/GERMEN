@@ -48,10 +48,13 @@ germen train --data meu-corpus.txt --preset mini --tokenizer bpe --vocab 4096 --
 germen generate --model meu-modelo --prompt "Era odată " --max-new 400
 ```
 
-Pressione **Ctrl-C** durante o treino: ele termina o passo atual, salva e sai. Retome mais tarde
-com o mesmo comando mais `--resume`: os pesos, o contador de passos e o estado do AdamW são
-restaurados, de modo que o treino segue sem o salto da perda de uma reinicialização a frio (as
-janelas de texto são sorteadas de novo).
+Pressione **Ctrl-C** durante o treino: ele termina o passo atual, salva e sai. Retome mais tarde com
+o mesmo comando mais `--resume`: os pesos, o contador de passos e o estado do AdamW são restaurados,
+de modo que o treino segue sem o salto da perda de uma reinicialização a frio (as janelas de texto
+são sorteadas de novo).
+
+O mesmo comando `train` executado de novo *sem* `--resume` é recusado, para que não substitua por
+engano um modelo treinado; `--overwrite` o permite quando se quer mesmo recomeçar.
 
 ## Comandos
 
@@ -62,6 +65,7 @@ janelas de texto são sorteadas de novo).
 | `germen demo-corpus` | escreve um corpus romeno sintético gerado a partir de uma gramática pequena (`--size-mb`) |
 | `germen train` | treina do zero (`--data ARQUIVO` ou `--demo`), ou continua com `--resume` |
 | `germen generate` | gera texto a partir de um modelo treinado, com um cache de chave/valor (`--temperature`, `--top-k`, `--prompt`) |
+| `germen verify` | verifica um checkpoint: o tamanho e o SHA-256 de cada arquivo segundo `meta.json` (o que `sha256sum` imprime); `--recover` termina um salvamento interrompido, sem precisar de texto algum |
 
 Opções de treino que vale conhecer: `--tokenizer byte|bpe` e `--vocab N` (o tamanho do BPE);
 `--batch` e `--accum` (acúmulo de gradientes: o lote efetivo é o produto dos dois, a memória é a de
@@ -154,18 +158,25 @@ crates/germen-cli    a linha de comando `germen` (clap)
   foi tentado na 0.2 e descartado; veja [docs/PLAN.md](docs/PLAN.md).
 * **Checkpoint** — uma pasta com `config.json`, `weights.bpk` (o formato burnpack do Burn, f32),
   `optimizer.bpk` (os momentos do AdamW), `tokenizer.json` e `meta.json`. Os checkpoints escritos
-  pela versão 0.1 continuam carregando.
-* **Testes** — 117 testes (unitários da biblioteca e da linha de comando, mais execuções completas
+  pela versão 0.1 continuam carregando. Desde a 0.4, `meta.json` registra também o tamanho e o
+  SHA-256 dos outros arquivos, verificados a cada carga: um arquivo danificado, truncado ou de outro
+  salvamento é nomeado no erro; os mais antigos carregam sem verificação.
+* **Testes** — 156 testes (unitários da biblioteca e da linha de comando, mais execuções completas
   do binário real), entre eles: a atenção é causal, a atenção em blocos é igual à do Burn (valores e
   gradientes), a geração com cache é igual à passagem completa, micro-lotes acumulados equivalem a
   um lote grande, as réplicas dão os gradientes de um único grafo grande e uma execução é
   reproduzível bit a bit, um passo de otimização após recarregar o estado do AdamW é igual ao de um
   treino ininterrupto, um checkpoint nunca fica escrito pela metade e pesos não finitos nunca são
   salvos, arquivos hostis de tokenizador e de configuração são recusados, toda sequência de bytes
-  sobrevive à ida e volta pelo BPE. A auditoria adversarial está em [docs/AUDIT.md](docs/AUDIT.md).
+  sobrevive à ida e volta pelo BPE. Um bit alterado num arquivo do checkpoint é detectado e o
+  arquivo é nomeado, e um salvamento interrompido a qualquer momento é concluído ou descartado. A
+  auditoria adversarial está em [docs/AUDIT.md](docs/AUDIT.md).
 
-## Limites (versão 0.3)
+## Limites (versão 0.4)
 
+* As somas de verificação protegem contra acidentes (um bit alterado, um arquivo truncado, arquivos
+  de dois salvamentos diferentes), não contra quem também possa editar o `meta.json`; checkpoints
+  escritos antes da 0.4 não podem ser verificados.
 * Todo o corpus é lido para a memória (como identificadores de 16 bits); estão previstos corpora
   mapeados em memória, maiores que a RAM.
 * Num único grafo, algumas operações do passo (RMSNorm, embeddings rotativos, atualização do AdamW)

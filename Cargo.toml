@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/germen-core", "crates/germen-cli"]
 
 [workspace.package]
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 rust-version = "1.95"
 license = "MIT"
@@ -12,6 +12,8 @@ repository = "https://github.com/chiuta/GERMEN"
 
 [workspace.dependencies]
 burn = { version = "=0.22.1", features = ["flex"] }
+# Already compiled as part of Burn; named here to read the header of an optimizer-state file.
+burn-pack = { version = "=0.22.1" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 clap = { version = "4", features = ["derive"] }

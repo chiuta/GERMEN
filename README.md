@@ -49,6 +49,9 @@ Press **Ctrl-C** during training: it finishes the current step, saves, and exits
 with the same command plus `--resume`: weights, step counter and AdamW state are restored, so
 training goes on without the loss bump of a cold restart (the random text windows are drawn anew).
 
+Running the same `train` command again *without* `--resume` is refused, so that it cannot replace a
+trained model by mistake; add `--overwrite` to start over on purpose.
+
 ## Commands
 
 | command | what it does |
@@ -58,6 +61,7 @@ training goes on without the loss bump of a cold restart (the random text window
 | `germen demo-corpus` | writes a synthetic Romanian corpus generated from a small grammar (`--size-mb`) |
 | `germen train` | trains from scratch (`--data FILE` or `--demo`), or continues with `--resume` |
 | `germen generate` | samples text from a trained model, with a key/value cache (`--temperature`, `--top-k`, `--prompt`) |
+| `germen verify` | checks a checkpoint: the size and SHA-256 of every file against `meta.json` (what `sha256sum` prints); `--recover` finishes a save that was cut off, without needing any text |
 
 Training options worth knowing: `--tokenizer byte|bpe` and `--vocab N` (the BPE size); `--batch` and
 `--accum` (gradient accumulation: the effective batch is their product, the memory is that of
@@ -143,19 +147,25 @@ crates/germen-cli    the `germen` command line (clap)
   `--replicas 1` gives the ordinary step). Spreading micro-batches over threads that all shared one
   graph was tried in 0.2 and rejected; see [docs/PLAN.md](docs/PLAN.md).
 * **Checkpoint** — a folder with `config.json`, `weights.bpk` (Burn's burnpack, f32),
-  `optimizer.bpk` (AdamW moments), `tokenizer.json` and `meta.json`. Checkpoints written by
-  version 0.1 still load.
-* **Tests** — 117 tests (unit tests of the library and of the command line, and end-to-end runs of
+  `optimizer.bpk` (AdamW moments), `tokenizer.json` and `meta.json`. Checkpoints written by version
+  0.1 still load. Since 0.4 `meta.json` also records the size and SHA-256 of the other files,
+  checked on every load: a damaged, truncated or mixed-up file is named in the error; older
+  checkpoints load unchecked.
+* **Tests** — 156 tests (unit tests of the library and of the command line, and end-to-end runs of
   the real binary), among them: attention is causal, block attention equals Burn's attention (values
   and gradients), cached generation equals the full forward pass, accumulated micro-batches equal
   one large batch, replicas give the gradients of one big graph and a run is reproducible bit for
   bit, an optimizer step after reloading the AdamW state equals the step of an uninterrupted run, a
   checkpoint is never left half-written and non-finite weights are never saved, hostile tokenizer
-  and configuration files are refused, every byte sequence survives the BPE round trip. The
-  adversarial audit is in [docs/AUDIT.md](docs/AUDIT.md).
+  and configuration files are refused, every byte sequence survives the BPE round trip. A flipped
+  bit in a checkpoint file is caught and the file named, and a save cut off at any moment is
+  completed or discarded. The adversarial audit is in [docs/AUDIT.md](docs/AUDIT.md).
 
-## Limitations (version 0.3)
+## Limitations (version 0.4)
 
+* The checksums guard against accidents (a flipped bit, a truncated file, files of two different
+  saves), not against someone who can edit `meta.json` as well; checkpoints written before 0.4
+  cannot be verified.
 * The whole corpus is read into memory (as 16-bit token ids); memory-mapped corpora larger than
   RAM are planned.
 * Inside one graph several operations of the step (RMSNorm, rotary embeddings, the AdamW update) do

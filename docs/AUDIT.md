@@ -1,8 +1,14 @@
-# Adversarial audit of GERMEN 0.2 — findings, fixes and what remains
+# Adversarial audit of GERMEN — findings, fixes and what remains
 
-Written for version 0.3.0 (17 November 2026). The audit was done by the people who wrote the code
-(the author and an AI assistant), so "adversarial" means *tried hard to break it*, not an
-independent review: [PLAN.md](PLAN.md) schedules one by someone else before 1.0.
+Two rounds, both on 17 November 2026 and both done by the people who wrote the code (the author and
+an AI assistant), so "adversarial" means *tried hard to break it*, not an independent review:
+[PLAN.md](PLAN.md) schedules one by someone else before 1.0.
+
+* **Part I — round 1** (sections 1–6): the 0.2.0 source, fixed in 0.3.0. Findings `A-01` … `A-24`.
+* **Part II — round 2** (sections 7–12): the 0.3.0 source (commit `c7bbf61`), fixed in 0.4.0.
+  Findings `B-01` … `B-10`. Where it changes something Part I said, §4 says so in place.
+
+# Part I — round 1: 0.2.0 → 0.3.0
 
 ## 1. Scope and method
 
@@ -360,15 +366,19 @@ element-wise operations around them run on one thread, which is what replicas hi
   `meta.json` last, but a crash between them can leave new weights next to an old `meta.json`:
   every file is complete and loads, yet the set is mixed, and no file records which save it belongs
   to. A generation number written into every file would close this; it is not done.
+  *Closed in 0.4.0: the manifest of every file in `meta.json` and the journal of a save (B-01,
+  B-04, §8).*
 * **The lock is advisory.** A program that ignores it (an older GERMEN, for one) is not stopped, and
   where a file system cannot lock (some network shares) the claim is skipped rather than refused.
 * **Limits refuse by size, not by proof.** There is no fuzzing; the hostile-input tests are
   hand-written, and a corrupt `weights.bpk` is only as safe as Burn's burnpack reader (six kinds of
   damage were tried).
+  *0.4.0 adds a fuzz harness and refuses by checksum, §7; it is still a sample.*
 * **The ceilings** of A-02 could in principle refuse a legitimate gigantic model (a context over
   16,384, a width over 16,384, more than 2^32 parameters); they are named constants in `config.rs`.
 * **The corpus is read whole.** A text file larger than the available memory is not refused before
-  it is read (planned: memory-mapped corpora, 0.4).
+  it is read (planned: memory-mapped corpora, 0.5). *0.4.0 refuses a text whose tokens cannot fit
+  before reading it (B-10); the corpus is still read whole.*
 * **Reproducibility** holds for a given seed, thread count and replica count, not across machines
   with different core counts (the order of floating-point sums differs), and not between 0.2 and 0.3.
   It also assumes that nothing outside GERMEN draws from the same Burn device while a model is being
@@ -410,3 +420,235 @@ target/release/germen bench --threads 2 --steps 8 --json b.json
 
 `audit_repro.py` needs a POSIX system (process groups, resource limits and signals); on Windows run
 it in WSL. It exits 1 if the new binary fails a scenario that is not purely informational.
+
+---
+
+# Part II — round 2: 0.3.0 → 0.4.0
+
+## 7. Scope and method
+
+**Audited:** the 0.3.0 source (commit `c7bbf61`), the claims of its README and CHANGELOG, and every
+place where §4 of round 1 admitted a residual risk. The inputs and the severity scale are those of
+§1. Round 1 reproduced suspicions one at a time; round 2 added three instruments:
+
+* **A hostile-input harness**, [`scripts/audit_fuzz.py`](../scripts/audit_fuzz.py). It throws
+  thousands of odd inputs at the real binary, each in a scratch directory, under an address-space
+  limit and a timeout, and classifies every run: *ok*, *error* (a refusal with a message: fine),
+  *running* (still going at the time limit, for runs that are meant to be long), *PANIC*, *ABORT*,
+  *SIGNAL*, *HANG*. Five suites: damaged and mixed checkpoints (`ckpt`: truncations, bit flips,
+  length-field bombs, files of another run, each through `generate` and through `train --resume`),
+  extreme values in `config.json`, `meta.json` and `tokenizer.json` (`json`), extreme values for
+  every option (`cli`), odd training texts (`data`: empty, NUL bytes, invalid UTF-8, one huge line,
+  a directory, a device) and saves that cannot finish (`disk`). For `ckpt` there is a fourth kind of
+  failure that round 1 could not see, because an exit code of 0 looks like success: a damaged
+  checkpoint that is *accepted*.
+* **Differential tests** wherever code was rewritten: the bounded pre-token scan against the
+  unbounded one it replaces, and each SHA-256 implementation against a textbook one, on random
+  inputs.
+* **Mutation proofs**, [`scripts/audit_mutations.py`](../scripts/audit_mutations.py). For each fix
+  the old defect (or one broken line of the new code) is put back in the source, the tests that are
+  meant to guard it are run and at least one must fail, then the file is restored. A test that
+  still passes against the defect proves nothing. The script has 26 entries (20 for the fixes of B-01 to B-10, six for
+  the fast SHA-256); every one is caught by at least one test.
+
+**Evidence codes** are those of §1, plus **F** — found by the fuzz harness (and then reproduced by
+hand against the 0.3.0 binary). The same machine as in round 1: Linux, 2 virtual CPUs (Intel Xeon
+at 2.1 GHz, with the SHA extensions), 8 GB of memory.
+
+## 8. Findings
+
+| ID | Severity | What happens in 0.3.0 | Evidence | In 0.4.0 |
+|---|---|---|---|---|
+| B-01 | Medium | one flipped bit in `weights.bpk` (or any other damage that leaves the file readable) is accepted: `generate` exits 0 and prints text from the damaged weights | R, F | every file has its size and SHA-256 in `meta.json`; a mismatch is refused, naming the file |
+| B-02 | Low | a tensor without a parameter id in `optimizer.bpk` makes `--resume` panic inside Burn (exit 101) | R, F | refused with a message |
+| B-03 | Medium | `--resume` with the optimizer state of another run is accepted; Burn silently skips the states it cannot match, so training goes on with moments that belong to nothing | R, F | refused |
+| B-04 | Medium | the weights of one run next to the `meta.json` of another load without a word (a save cut off between two renames would leave exactly that: §4) | R, F | refused, naming the file and the remedy; `--resume` and `verify --recover` finish an interrupted save |
+| B-05 | Medium | `--resume` without `meta.json` starts again from step 0 and trains over the weights it just loaded | R, F | refused (`generate` does not need `meta.json`) |
+| B-06 | Medium | running the same `train` command again replaces a trained model in `--out` at the first save | R | refused unless `--resume` or `--overwrite` |
+| B-07 | Low | `--tokenizer bpe` on text without blanks scans quadratically: 5 MB of one letter had not finished after 90 s | R, F | linear: 0.2 s |
+| B-08 | Low | `norm_eps = 1e-300` or `1e300` and `rope_theta = 0.5` or `1e30` pass `validate`, and the model computes with numbers that overflow or vanish | R | bounds: `rope_theta` in [1, 10¹²], `norm_eps` in [10⁻¹², 1] |
+| B-09 | Low | `bench --steps 2147483648` aborts allocating 16 GiB for its timings, `--steps 2^63` panics, `--warmup 2^64-1` wraps and prints `NaN ms/step` | R, F | refused or run; nothing is reserved up front |
+| B-10 | Low | a text whose tokens cannot fit in memory is read whole first, and then the allocator aborts the process (`memory allocation of N bytes failed`) | I | refused before it is read, with the size and the limit |
+
+Reading the evidence column: nine findings are black-box scenarios of `audit_repro.py` (B-01 to
+B-09) that fail against the 0.3.0 binary and pass against 0.4.0; the harness found seven of them on
+its own (F). B-10 could only be established by reading the code: reproducing it means asking the
+operating system for more memory than the machine has, which can take the machine down with it.
+
+**What the harness saw**, per suite and binary (Linux, one run of each; "bad" is a panic, an abort,
+a signal or a hang; for `ckpt`, damaged checkpoints that were accepted are counted on their own):
+
+| suite | runs 0.3.0 / 0.4.0 | 0.3.0 | 0.4.0 |
+|---|---|---|---|
+| `ckpt` — damaged, truncated and mixed checkpoints, each through `generate` and `train --resume` | 464 / 468 | 4 panics (B-02); 206 damaged or mixed checkpoints **accepted** (B-01, B-03, B-04, B-05) | 0 bad; 3 accepted, all of them cases `generate` may accept (it needs neither `optimizer.bpk` nor `meta.json`, and says so when the manifest is missing) |
+| `ckpt` on checkpoints *written by 0.3.0* (no manifest) | — / 468 | — | 0 bad; 177 accepted (nothing records what their bytes should be: B-01 can only be closed from the next save on) |
+| `json` — extreme values in the three JSON files | 440 / 461 | 0 bad | 0 bad |
+| `cli` — extreme values for every option | 1,448 / 1,448 | 6 bad: `bench --steps` of 2³¹ and more, 3 aborts and 3 panics (B-09) | 0 bad (42 runs still going at the time limit, as long runs should be) |
+| `data` — odd training texts | 112 / 112 | 3 bad: BPE on 5 MB without a blank, still running after 60 s (B-07) | 0 bad |
+| `disk` — saves that cannot finish | 12 / 12 | 0 bad | 0 bad |
+| all | 2,476 / 2,969 | 13 bad, 206 accepted | 0 bad |
+
+### Details
+
+**B-01 — damage that still parses.** In 0.3.0 the loader checked that a file could be read and that
+the weights were finite; nothing said whether they were the weights that had been saved. Of 464
+mutated checkpoints, 206 ran to the end with exit 0. The mutations that matter: 45 bit flips in the
+tensor data of `weights.bpk` that `generate` accepted without any change in its output (a flipped
+low bit), 3 more that changed it, a `weights.bpk` of another run, an `optimizer.bpk` of another run
+or of another size, a deleted `meta.json` or `tokenizer.json`, 4 KiB of garbage appended to a file.
+Fix: `meta.json` now has a `files` map with the size and SHA-256 of every other file of the set,
+written by the same save that wrote the files, and checked at every load for the files that the
+command reads (`generate`: weights, configuration and tokenizer; `train --resume`: also the
+optimizer). The error names the file and shows the first twelve digits of both sums. `germen
+verify DIR` checks all of them and also loads the weights and the optimizer. The sums are plain
+SHA-256 of the file as `sha256sum`, `shasum -a 256` or `Get-FileHash` print it, so a checkpoint that
+is published or copied can be checked without GERMEN; the manifests written by the audit's own runs
+were compared with `hashlib` and `sha256sum` (16 files). Checkpoints without a manifest (0.3.0 and
+older) still load, with a one-line notice that nothing could be vouched for, and get one at the next
+save.
+
+**B-02 and B-03 — the optimizer file.** Burn's `load_record` panics on a tensor that has no
+parameter id and silently skips a state it cannot match, so a file that was almost right, or right
+for another model, was either a crash or an unannounced restart of the moments. Fix:
+`check_optimizer_file` reads the burnpack header itself, before Burn sees the file: every id must
+be one of the model's, the shapes must be equal, the tensor names must be `"{id}.…"`, and the
+number of states Burn ends up with must equal the number stored (so that nothing was skipped); a
+`catch_unwind` around Burn's loader is the last backstop. B-03 is also tested with the manifest
+stripped, so that the structural check is what is exercised and not the checksum.
+
+**B-04 — a set that does not belong together; a save cut short.** §4 of round 1 named this as the
+residual risk of staged writing: every file is whole and loads, yet the set is mixed. The manifest
+closes the case in which the files came from different saves, however they got there. For the case
+that a run dies *during* the renames, a save is now a small journal: every temporary file is
+complete and flushed, and `meta.json.tmp` with the manifest exists, before the first rename. What a
+dead run leaves is therefore enough to finish the job, and `checkpoint::recover` does: it completes
+a save that got as far as publishing its first file and discards one that did not, so the
+checkpoint is always the old set or the new one. `train --resume` does it before it loads;
+`germen verify --recover DIR` does it on request; a load that meets a torn set is refused with a
+message that names this remedy. In the SIGKILL experiment of round 1 (A-04n: 25 kills during
+back-to-back saves) all 25 left a checkpoint that loaded in 0.3.0; in 0.4.0 two of the 25 left a
+set cut off between two renames, both were detected and refused as an interrupted save, and both
+were completed by `--resume` (none of the 25 unrecoverable).
+
+**B-05, B-06 — silent restarts.** Both are a misleading success rather than a crash, which is why
+nothing flagged them. `--resume` now needs the progress record (`meta.json`): without it the step
+counter, and everything that depends on it, would start again from zero over weights that are
+already trained. And a fresh `train` into a
+directory that already holds a checkpoint stops before it trains or writes anything, with a message that
+offers `--resume` and `--overwrite`; the CI smoke test and the end-to-end tests check that nothing
+on disk changed. This is a change of behaviour, and the reason for 0.4.0 rather than 0.3.1.
+
+**B-07 — the cliff in the pre-tokenizer.** `pretoken_end` found where a run of same-class bytes
+ends by walking all of it, then cut the result to the cap of 64 bytes: every position of a run of
+*n* bytes scanned *n* bytes, so 5 MB of the letter `a` is about 10¹³ byte comparisons. The scan now stops at the cap
+(`reach = n.min(i + MAX_PRETOKEN + 1)`). Boundaries must not move, or every vocabulary already
+trained would change: the old function is kept in the tests as a reference and compared with the
+new one on random text and on long runs of every class. 0.3.0: timed out after 90 s; 0.4.0: 0.2 s.
+
+**B-08, B-09, B-10 — numbers.** B-08: two floating-point fields of `config.json` were only checked
+to be finite and positive. B-09: `bench` summed `warmup + steps` unchecked (with one step, a
+warm-up of 2⁶⁴−1 wraps to zero steps in all, and the mean of nothing is `NaN`) and reserved a vector
+of `steps` timings up front (16 GiB for 2³¹, capacity overflow for 2⁶³). The sum is now checked and
+the reservation is capped at 65,536 entries; the vector grows as steps are really taken. B-10: reading
+a big text can succeed and the tokens made from it still not fit, and then the allocator aborts the
+process after the slow part is done. The corpus pre-check (`sys::check_corpus_fits`) compares the
+size of the text, times 3 for the byte tokenizer (the text plus a two-byte token for each of its
+bytes) or times 2 when a BPE vocabulary is learned, with 90 % of the memory the operating system
+reports as available, and refuses before `std::fs::read`.
+
+## 9. Performance audit
+
+The same rule as in §3: nothing stays on a hunch; interleaved A/B runs (A B B A …) of the real
+binaries on one machine, medians.
+
+**Q-01 — the pre-tokenizer cliff (B-07).** On ordinary text nothing changed (BPE vocabulary on the
+2 MiB demo corpus plus one step: 0.196 s against 0.182 s, three interleaved pairs, inside the
+noise). On text with long runs it is the difference between 0.2 s and "did not finish".
+
+**Q-02 — SHA-256.** The manifest has a price: every load hashes the files it reads. The first
+implementation, the textbook one in safe Rust, ran at about 205 MB/s here, which made `germen
+verify` of a 1 GB checkpoint (the `base` preset: 341 MB of weights and 683 MB of optimizer state)
+take 6.5 s (measured), and would make loading the model for `generate` about 1.5 s slower (computed
+from the speed, not measured). Two steps were measured, each on 64 MiB, best of four, in turns, in
+two separate runs:
+
+| version | speed | against the textbook |
+|---|---|---|
+| textbook (64-word schedule, shuffled variables) | 200–213 MB/s | 1.0× |
+| portable, unrolled (16-word window, rotated names) | 234–240 MB/s | 1.1–1.2× |
+| the SHA instructions of the processor (x86-64, found at run time) | 1,310–1,317 MB/s | 6.2–6.6× |
+
+The last is as fast as `sha256sum` on the same machine (1.02 GB in 0.87 s, reading included). With
+it, on the `base` checkpoint: `germen verify` takes 2.3 s (hashing is now about 0.8 s of it; the
+rest is loading and checking the tensors); loading for `generate` costs 0.27 s more than in 0.3.0 (0.34 s
+→ 0.61 s, four interleaved pairs) with the same peak memory, because the file is hashed in pieces
+of 1 MiB; and a one-step `base` training run including its final save of 977 MB took 12.7 s against
+13.1 s for 0.3.0 (three pairs, ranges overlapping: no measurable cost). `bench` on `nano` is
+unchanged (0.52 s against 0.51 s over four pairs).
+
+**Tried and not done.**
+* *The `sha2` crate* would have added seven crates to the build for something the in-house version
+  now does as fast as `sha256sum`.
+* *A `--no-verify` flag.* At 0.27 s per 341 MB it is not worth a way to load unchecked files.
+* *Hashing the files of a set on several threads* is bounded by the largest file (two thirds of
+  the total): at most 1.5× on top of the above; not done.
+* *The SHA instructions of ARM processors* (Apple silicon, Windows on ARM, Graviton) are not used:
+  there is no such machine here to test them on. They run the portable version, about 240 MB/s,
+  so a 1 GB checkpoint takes about 4 s to hash there.
+
+## 10. Trade-offs and residual risks
+
+* **The sums protect against accidents, not against a person.** Anyone who can edit `meta.json`
+  can also edit the sums. SHA-256 here is a checksum that anyone can recompute, not a signature.
+* **Compatibility.** A 0.4.0 checkpoint can be read by 0.3.0 (the extra `files` field is ignored)
+  but 0.3.0 does not verify it. A checkpoint from 0.3.0 or earlier loads in 0.4.0 with a notice and
+  gets its manifest at the next save; once a manifest exists, an optimizer file it does not list is
+  refused. Scripts that re-ran `train` into an existing directory to replace its model need
+  `--overwrite`.
+* **A torn save needs one action.** `generate` refuses it and names the remedy; it does not repair
+  it silently. The journal makes the repair possible, not automatic.
+* **The memory pre-check (B-10) is a guard against the obvious mistake.** It goes by the memory the
+  operating system calls available, so a limit set with `ulimit -v` or by a container is invisible
+  to it, and a text that fits in memory but not in the limit still fails at the allocation.
+* **The harness is a sample.** "0 bad" in the table above means none of those runs; it is not a
+  proof, and the mutations are the ones that someone thought of (plus the random ones: bit flips).
+* **`unsafe`.** There are now two calls in the workspace, not one: the Windows memory probe of
+  round 1 and the call into the SHA instructions, made only after the processor has said it has
+  them. The second is checked three ways: a differential test of both implementations on 10,000
+  random states and inputs against the textbook version, the NIST and `hashlib` vectors on both,
+  and six mutation proofs (S-01 to S-06) that break one line of the fast path at a time.
+* **The portable fallback is slow** (see Q-02) on processors without the instructions or outside
+  x86-64.
+* **Reproducibility** is as in round 1; nothing in this round changes what a seed produces.
+
+## 11. What has not been verified
+
+* **CI.** At the time of writing the 0.4.0 workflow had not run on GitHub: the Windows and macOS
+  runs, which include the new smoke steps (`verify`, the refusal of a fresh run, `--overwrite`), the
+  memory-probe test on each system and the job with Rust 1.95, are the next thing to check.
+* **The SHA instructions on any processor but the one used here**, and the portable version on a
+  real ARM machine (it is tested on this one by calling it directly).
+* **Windows and macOS under a crash.** The torn-save tests construct the state of a cut-off save by
+  hand and are platform independent, but the SIGKILL experiment ran only on Linux, and no one has
+  watched NTFS or APFS meet a power cut half-way through the renames.
+* **A hostile but self-consistent checkpoint.** Someone who recomputes `meta.json` gets past the
+  manifest and meets Burn's reader, whose limits are those of §4.
+* **A bigger machine and real training runs** (§3.3): nothing in this round was measured above two
+  cores.
+
+## 12. Reproducing round 2
+
+```sh
+cargo build --release
+# the nine black-box scenarios, against the new build and the 0.3.0 one (B-01 to B-09):
+python3 scripts/audit_repro.py --new target/release/germen --old /path/to/germen-0.3.0 B-
+# the hostile-input harness: all suites (about ten minutes), and checkpoints written by 0.3.0
+python3 scripts/audit_fuzz.py --bin target/release/germen --json fuzz.json
+python3 scripts/audit_fuzz.py --bin target/release/germen --only ckpt --base-bin /path/to/germen-0.3.0
+# mutation proofs (about ten minutes; edits the sources in place and restores them):
+python3 scripts/audit_mutations.py
+# the speed of SHA-256, every implementation in turn:
+cargo test --release -p germen-core --lib sha256_throughput -- --ignored --nocapture
+# a checkpoint can be checked without GERMEN; compare with the `files` map of meta.json:
+sha256sum DIR/weights.bpk DIR/optimizer.bpk DIR/tokenizer.json DIR/config.json
+```

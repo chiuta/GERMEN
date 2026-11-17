@@ -95,11 +95,14 @@ impl GptConfig {
                 ));
             }
         }
-        if !(self.rope_theta.is_finite() && self.rope_theta > 0.0) {
-            return Err("rope_theta trebuie să fie un număr finit pozitiv".into());
+        // Finite and positive is not enough: an epsilon below f32's smallest number is 0 once it
+        // is used (a zero vector then normalises to NaN), and one above 1 is no epsilon at all;
+        // a base below 1 makes the rotary frequencies grow instead of shrink.
+        if !(1.0..=1e12).contains(&self.rope_theta) {
+            return Err("rope_theta trebuie să fie un număr între 1 și 1e12".into());
         }
-        if !(self.norm_eps.is_finite() && self.norm_eps > 0.0) {
-            return Err("norm_eps trebuie să fie un număr finit pozitiv".into());
+        if !(1e-12..=1.0).contains(&self.norm_eps) {
+            return Err("norm_eps trebuie să fie un număr între 1e-12 și 1".into());
         }
         let params = self.param_count();
         if params > MAX_PARAMS as u128 {
@@ -269,7 +272,7 @@ mod tests {
         let base = || Preset::Nano.config(64);
         assert!(base().validate().is_ok());
         type Tweak = fn(&mut GptConfig);
-        let broken: [(&str, Tweak); 14] = [
+        let broken: [(&str, Tweak); 18] = [
             ("zero width", |c| c.d_model = 0),
             ("zero feed-forward", |c| c.d_ff = 0),
             ("NaN rope_theta", |c| c.rope_theta = f32::NAN),
@@ -279,6 +282,12 @@ mod tests {
             ("NaN norm_eps", |c| c.norm_eps = f64::NAN),
             ("zero norm_eps", |c| c.norm_eps = 0.0),
             ("negative norm_eps", |c| c.norm_eps = -1e-5),
+            // Finite, positive, and still useless: 1e-300 becomes 0.0 as an f32, 1e300 becomes
+            // infinity, and a rope base under 1 turns the frequencies upside down.
+            ("tiny norm_eps", |c| c.norm_eps = 1e-300),
+            ("huge norm_eps", |c| c.norm_eps = 1e300),
+            ("rope_theta below 1", |c| c.rope_theta = 0.5),
+            ("huge rope_theta", |c| c.rope_theta = 1e30),
             // The causal mask is block_size² floats: this would be 4 exabytes.
             ("huge block_size", |c| c.block_size = 1 << 31),
             ("huge vocabulary", |c| c.vocab_size = usize::MAX),

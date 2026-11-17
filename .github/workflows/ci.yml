@@ -65,7 +65,7 @@ jobs:
         run: cargo test --release --workspace
       - name: Build the command-line tool
         run: cargo build --release -p germen-cli
-      - name: Smoke test, end to end (bench, train, resume, BPE, generate)
+      - name: Smoke test, end to end (bench, train, resume, BPE, generate, verify)
         shell: bash
         run: |
           BIN=target/release/germen
@@ -83,6 +83,18 @@ jobs:
                  --steps 60 --eval-every 20 --eval-batches 2 --log-every 10 \
                  --out ci-model --resume
           "$BIN" generate --model ci-model --max-new 40 --seed 1
+          # Integrity: every file of the checkpoint matches the size and SHA-256 recorded in meta.json
+          "$BIN" verify ci-model
+          # The same fresh run again would replace the trained model: it is refused, and nothing changes
+          if "$BIN" train --demo --demo-mb 0.2 --preset nano --seq 64 --batch 8 --steps 2 \
+                    --out ci-model; then
+            echo "a fresh run replaced a trained checkpoint"; exit 1
+          fi
+          "$BIN" verify ci-model
+          # ... unless it is asked for in so many words
+          "$BIN" train --demo --demo-mb 0.2 --preset nano --seq 64 --batch 8 --steps 2 \
+                 --log-every 1 --out ci-model --overwrite
+          "$BIN" verify ci-model
           # Data-parallel replicas: forced above the number of threads, and switched off
           "$BIN" train --demo --demo-mb 0.2 --preset nano --seq 64 --batch 8 --replicas 3 \
                  --steps 20 --eval-every 10 --eval-batches 2 --log-every 10 --out ci-replicas

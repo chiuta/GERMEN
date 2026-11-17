@@ -1,6 +1,6 @@
 # GERMEN — plan and decisions
 
-Status: version 0.3.0 (November 2026). The name is provisional; check it against trademark
+Status: version 0.4.0 (November 2026). The name is provisional; check it against trademark
 databases (EUIPO / TMview) before any public launch.
 
 ## 1. Goal
@@ -121,9 +121,12 @@ feed-forward and attention blocks.
   gradient accumulation; `bench --scaling`; READMEs in eight languages.
 * **0.3 (done)** — adversarial audit ([AUDIT.md](AUDIT.md)): hostile input files, atomic
   checkpoints, option validation, Windows/macOS memory probes; data-parallel replicas.
-* **0.4** — memory-mapped corpora larger than RAM; desktop GUI (egui) with live loss curve and
+* **0.4 (done)** — second adversarial audit ([AUDIT.md](AUDIT.md), Part II): checkpoint manifest
+  with SHA-256, `germen verify`, a journal for saves, strict `--resume`, no silent overwrite,
+  bounded pre-token scan, hardware SHA-256.
+* **0.5** — memory-mapped corpora larger than RAM; desktop GUI (egui) with live loss curve and
   samples; safetensors export/import; whatever the first many-core measurement calls for.
-* **0.5** — opt-in GPU backend (`wgpu`) behind a Cargo feature; community benchmark table.
+* **0.6** — opt-in GPU backend (`wgpu`) behind a Cargo feature; community benchmark table.
 * **1.0** — the command-line messages in the project's usual languages; releases for Windows,
   Linux and macOS built by CI; a second adversarial audit (by someone other than the author of the
   code) before the announcement.
@@ -137,7 +140,7 @@ feed-forward and attention blocks.
    engine file over shared headers, with no step-by-step guide. A GERMEN model (dense,
    squared-ReLU feed-forward, byte or BPE vocabulary) is not among the listed architectures, so it
    cannot be loaded there unchanged. Nothing has been tried; a GGUF or safetensors export would be
-   the first step and is not planned before 0.4. Source: the README of
+   the first step and is not planned before 0.5. Source: the README of
    <https://github.com/JustVugg/colibri>, read on 2026-11-17.
 3. **Training data** — any pre-trained model that is shipped needs a corpus whose licence allows
    it (public-domain literature, openly licensed Wikipedia text, own writing). Not decided.
@@ -147,12 +150,16 @@ feed-forward and attention blocks.
 
 ## 7. What has been verified so far
 
-* 117 tests pass (release build, Linux): unit tests of the library and of the command line, and
+* 156 tests pass (release build, Linux): unit tests of the library and of the command line, and
   end-to-end runs of the real binary. The core suite ran 40 times in a row in parallel mode
   without a failure; before the fix of A-24 it failed in 2 of 13 runs.
-* The adversarial audit of 0.2 ([AUDIT.md](AUDIT.md)): 15 findings reproduced against a 0.2.0 binary
-  and gone in 0.3.0, two suspicions that did not reproduce, seven found by reading the code, and
-  one (A-24) found by verifying 0.3.0 itself in a clean directory.
+* The adversarial audit of 0.2 ([AUDIT.md](AUDIT.md), Part I): 15 findings reproduced against a
+  0.2.0 binary and gone in 0.3.0, two suspicions that did not reproduce, seven found by reading the
+  code, and one (A-24) found by verifying 0.3.0 itself in a clean directory.
+* The audit of 0.3.0 (Part II): nine findings reproduced against a 0.3.0 binary and gone in 0.4.0,
+  one found by reading the code; a hostile-input harness that classifies every run (damaged
+  checkpoints: 206 of 464 accepted by 0.3.0, 3 of 468 by 0.4.0, all three legitimate for
+  `generate`); mutation proofs for every fix, which fail against the old defect.
 * Short real runs on the synthetic corpus, byte and BPE vocabularies: the loss falls well below
   the untrained value in a few dozen steps and the generated text follows the grammar of the
   corpus; interrupting and resuming works, including from a 0.1 checkpoint.

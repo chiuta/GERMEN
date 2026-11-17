@@ -261,6 +261,40 @@ pub fn check_memory_fits(need_bytes: u64, batch: usize, seq: usize) -> Result<()
     Ok(())
 }
 
+/// Refuses a text whose reading and tokenizing cannot fit in memory, before a byte of it is read.
+///
+/// `bytes_per_byte` is how much memory each byte of text needs at the very least: 3 for the byte
+/// tokenizer (the text itself plus a 2-byte token for each of its bytes), 2 when a BPE vocabulary,
+/// which packs several bytes into one token, does the tokenizing. Without the check, a text that
+/// is read successfully but whose tokens do not fit makes the allocator abort the process
+/// ("memory allocation of N bytes failed") after the slow part of the work is done.
+///
+/// Like [`check_memory_fits`], it goes by what the operating system reports as available; it
+/// cannot see a limit set on the process itself (`ulimit -v`, a container's memory limit).
+pub fn check_corpus_fits(text_bytes: u64, bytes_per_byte: u64) -> Result<(), String> {
+    check_corpus_fits_within(text_bytes, bytes_per_byte, memory_limit_bytes())
+}
+
+fn check_corpus_fits_within(
+    text_bytes: u64,
+    bytes_per_byte: u64,
+    limit_bytes: f64,
+) -> Result<(), String> {
+    const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
+    let need = text_bytes.saturating_mul(bytes_per_byte) as f64;
+    if need > limit_bytes {
+        return Err(format!(
+            "textul are {:.2} GiB și ar cere cel puțin {:.1} GiB de memorie (textul însuși și \
+             tokenii lui), iar limita acceptată aici este ~{:.1} GiB; folosiți un fișier mai mic \
+             (citirea pe bucăți nu e încă implementată)",
+            text_bytes as f64 / GIB,
+            need / GIB,
+            limit_bytes / GIB
+        ));
+    }
+    Ok(())
+}
+
 /// Formats a duration in seconds as `"3 min 20 s"`, `"2 h 05 min"` or `"1 z 04 h"`.
 pub fn human_duration(secs: f64) -> String {
     if !secs.is_finite() || secs < 0.0 {
@@ -289,6 +323,23 @@ mod tests {
         assert_eq!(human_duration(7500.0), "2 h 05 min");
         assert_eq!(human_duration(90_000.0), "1 z 01 h");
         assert_eq!(human_duration(f64::NAN), "—");
+    }
+
+    #[test]
+    fn a_text_that_cannot_fit_is_refused_before_it_is_read() {
+        const GIB: u64 = 1 << 30;
+        let limit = 10.0 * GIB as f64;
+        // 4 GiB of text is 12 GiB through the byte tokenizer and 8 GiB through BPE.
+        let err = check_corpus_fits_within(4 * GIB, 3, limit).unwrap_err();
+        assert!(
+            err.contains("4.00 GiB") && err.contains("12.0 GiB") && err.contains("10.0 GiB"),
+            "{err}"
+        );
+        assert!(check_corpus_fits_within(4 * GIB, 2, limit).is_ok());
+        assert!(check_corpus_fits_within(0, 3, limit).is_ok());
+        // However absurd the size, the arithmetic saturates instead of wrapping to something small.
+        assert!(check_corpus_fits_within(u64::MAX, u64::MAX, limit).is_err());
+        assert!(check_corpus_fits_within(u64::MAX, 3, limit).is_err());
     }
 
     #[test]

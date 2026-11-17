@@ -82,15 +82,22 @@ fn class(b: u8) -> u8 {
 }
 
 /// End of the pre-token that starts at `i` (`i < data.len()`).
+///
+/// A pre-token is at most `MAX_PRETOKEN` bytes long, so the scan never looks further than one byte
+/// beyond that (the extra byte tells a run of blanks that ends exactly at the cap from one that
+/// goes on). It used to walk to the end of the run and clamp afterwards, which made every cut in
+/// a long run cost the rest of the run: 5 MB of one repeated letter, or of text without a blank
+/// (minified JSON, DNA, base64), took minutes instead of milliseconds.
 fn pretoken_end(data: &[u8], i: usize) -> usize {
     let n = data.len();
+    let reach = n.min(i + MAX_PRETOKEN + 1);
     let mut j = i;
     // A single space glues to the word that follows it (" word").
     if data[j] == b' ' && j + 1 < n && !is_whitespace(data[j + 1]) {
         j += 1;
     }
     if is_whitespace(data[j]) {
-        while j < n && is_whitespace(data[j]) {
+        while j < reach && is_whitespace(data[j]) {
             j += 1;
         }
         // In "  word" the last space belongs to the word, the rest is a pre-token of its own.
@@ -99,7 +106,7 @@ fn pretoken_end(data: &[u8], i: usize) -> usize {
         }
     } else {
         let c = class(data[j]);
-        while j < n && !is_whitespace(data[j]) && class(data[j]) == c {
+        while j < reach && !is_whitespace(data[j]) && class(data[j]) == c {
             j += 1;
         }
     }
@@ -476,6 +483,127 @@ mod tests {
         // A very long run is cut, not turned into one enormous pre-token.
         let long = vec![b'a'; 1000];
         assert!(PreTokens::new(&long).all(|r| r.len() <= MAX_PRETOKEN));
+    }
+
+    /// The pre-tokenizer as it was before the scan was bounded: it walks to the end of the run
+    /// and clamps afterwards. Kept as the reference the bounded one must agree with.
+    fn pretoken_end_unbounded(data: &[u8], i: usize) -> usize {
+        let n = data.len();
+        let mut j = i;
+        if data[j] == b' ' && j + 1 < n && !is_whitespace(data[j + 1]) {
+            j += 1;
+        }
+        if is_whitespace(data[j]) {
+            while j < n && is_whitespace(data[j]) {
+                j += 1;
+            }
+            if j < n && j - i > 1 && data[j - 1] == b' ' {
+                j -= 1;
+            }
+        } else {
+            let c = class(data[j]);
+            while j < n && !is_whitespace(data[j]) && class(data[j]) == c {
+                j += 1;
+            }
+        }
+        j.min(i + MAX_PRETOKEN).max(i + 1)
+    }
+
+    #[test]
+    fn bounding_the_scan_moves_no_boundary() {
+        // Every start position of many inputs made of runs (blanks, spaces, letters, digits,
+        // punctuation, two-byte letters, mixed blanks) whose lengths straddle the cap, because
+        // the cap is where the two versions could differ.
+        let mut state = 99u64;
+        let mut next = |bound: usize| {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((state >> 33) as usize) % bound
+        };
+        let lengths = [
+            1usize, 2, 3, 31, 32, 33, 62, 63, 64, 65, 66, 67, 127, 128, 129, 130, 200,
+        ];
+        let units: [&[u8]; 9] = [
+            b" ",
+            b"\n",
+            b"a",
+            b"7",
+            b".",
+            "é".as_bytes(),
+            b" \n",
+            b"\t ",
+            b"  x",
+        ];
+        for case in 0..1500 {
+            let mut data = Vec::new();
+            for _ in 0..1 + next(5) {
+                let (len, unit) = (lengths[next(lengths.len())], units[next(units.len())]);
+                for _ in 0..len {
+                    data.extend_from_slice(unit);
+                }
+            }
+            for i in 0..data.len() {
+                assert_eq!(
+                    pretoken_end(&data, i),
+                    pretoken_end_unbounded(&data, i),
+                    "case {case}, start {i}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn text_without_blanks_trains_and_encodes_in_linear_time() {
+        // Minified JSON, DNA, base64, a log line without a space: the pre-tokenizer cuts such
+        // text at 64 bytes. With the unbounded scan, training and encoding 2 MiB of it took
+        // minutes (and 5 MB, the size the audit used, more than an hour of a core).
+        let mut state = 7u64;
+        let mut dna = Vec::with_capacity(2 << 20);
+        for _ in 0..(2 << 20) {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            dna.push(b"ACGT"[((state >> 33) & 3) as usize]);
+        }
+        let ab: Vec<u8> = (0..2 << 20).map(|i| b"ab"[i % 2]).collect();
+        for (what, data) in [
+            ("one letter", vec![b'a'; 2 << 20]),
+            ("ab", ab),
+            ("dna", dna),
+        ] {
+            let started = std::time::Instant::now();
+            let bpe = Bpe::train(&data, 300, &mut |_, _| {}).unwrap();
+            let ids = bpe.encode(&data);
+            let back: Vec<u8> = ids
+                .iter()
+                .flat_map(|&t| bpe.token_bytes(t).iter().copied())
+                .collect();
+            assert!(back == data, "{what}: the text must survive the round trip");
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(20),
+                "{what}: training and encoding took {:?}",
+                started.elapsed()
+            );
+        }
+    }
+
+    #[test]
+    fn a_long_run_without_blanks_is_cut_in_linear_time() {
+        // A megabyte of one letter is 16 384 pre-tokens. With the unbounded scan each cut cost the
+        // rest of the run (about 8 * 10^9 steps in all, several seconds); bounded, it is
+        // a few milliseconds, so a second is a safe limit on any machine.
+        for fill in *b"a7 ." {
+            let data = vec![fill; 1 << 20];
+            let started = std::time::Instant::now();
+            let cuts = PreTokens::new(&data).count();
+            assert_eq!(cuts, (1 << 20) / MAX_PRETOKEN, "fill {fill}");
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(1),
+                "cutting a long run took {:?}",
+                started.elapsed()
+            );
+        }
     }
 
     #[test]

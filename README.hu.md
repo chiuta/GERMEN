@@ -53,6 +53,9 @@ ugyanazzal a paranccsal és a `--resume` kapcsolóval: a súlyok, a lépésszám
 visszaáll, így a tanítás a hidegindítás okozta veszteségugrás nélkül folytatódik (a szövegablakokat
 újra véletlenszerűen húzza).
 
+Ugyanaz a `train` parancs `--resume` *nélkül* újra kiadva elutasításra kerül, hogy ne írjon felül
+véletlenül egy betanított modellt; az `--overwrite` megengedi, ha tényleg elölről akarod kezdeni.
+
 ## Parancsok
 
 | parancs | mit csinál |
@@ -62,6 +65,7 @@ visszaáll, így a tanítás a hidegindítás okozta veszteségugrás nélkül f
 | `germen demo-corpus` | egy kis nyelvtanból generált szintetikus román korpuszt ír (`--size-mb`) |
 | `germen train` | a nulláról tanít (`--data FÁJL` vagy `--demo`), vagy a `--resume` kapcsolóval folytatja |
 | `germen generate` | szöveget generál egy betanított modellből, kulcs–érték gyorsítótárral (`--temperature`, `--top-k`, `--prompt`) |
+| `germen verify` | ellenőriz egy ellenőrzőpontot: minden fájl méretét és SHA-256 összegét a `meta.json` alapján (amit a `sha256sum` kiír); a `--recover` befejez egy megszakadt mentést, szöveg nélkül |
 
 Érdemes ismerni ezeket a tanítási kapcsolókat: `--tokenizer byte|bpe` és `--vocab N` (a BPE mérete);
 `--batch` és `--accum` (gradiens-felhalmozás: a tényleges köteg a kettő szorzata, a memória csak a
@@ -152,20 +156,26 @@ crates/germen-cli    a `germen` parancssor (clap)
   elosztását olyan szálak között, amelyek mind ugyanazt az egyetlen gráfot használták, a 0.2-ben
   kipróbáltuk és elvetettük; lásd a [docs/PLAN.md](docs/PLAN.md) fájlt.
 * **Ellenőrzőpont** — egy mappa `config.json`, `weights.bpk` (a Burn burnpack formátuma, f32),
-  `optimizer.bpk` (az AdamW momentumai), `tokenizer.json` és `meta.json` fájlokkal. A 0.1-es
-  verzió által írt ellenőrzőpontok továbbra is betölthetők.
-* **Tesztek** — 117 teszt (a könyvtár és a parancssor egységtesztjei, valamint a valódi bináris
+  `optimizer.bpk` (az AdamW momentumai), `tokenizer.json` és `meta.json` fájlokkal. A 0.1-es verzió
+  által írt ellenőrzőpontok továbbra is betölthetők. A 0.4 óta a `meta.json` a többi fájl méretét és
+  SHA-256 összegét is rögzíti, minden betöltéskor ellenőrizve: a sérült, csonka vagy másik mentésből
+  való fájlt a hibaüzenet néven nevezi; a régebbiek ellenőrzés nélkül töltődnek be.
+* **Tesztek** — 156 teszt (a könyvtár és a parancssor egységtesztjei, valamint a valódi bináris
   teljes futtatásai), köztük: a figyelem oksági, a blokkos figyelem megegyezik a Burnéval (értékek
   és gradiensek), a gyorsítótáras generálás megegyezik a teljes átfutással, a felhalmozott
   mikro-kötegek egyenértékűek egy nagy köteggel, a replikák egyetlen nagy gráf gradienseit adják és
   egy futás bitre pontosan reprodukálható, egy optimalizálási lépés az AdamW állapotának újratöltése
   után megegyezik a megszakítatlan tanítás lépésével, egy ellenőrzőpont sosem marad félig megírva és
   nem véges súlyokat sosem mentünk, az ellenséges tokenizer- és konfigurációs fájlok elutasításra
-  kerülnek, minden bájtsorozat átvészeli az oda-vissza utat a BPE-n. Az ellenséges szemléletű
-  auditról a [docs/AUDIT.md](docs/AUDIT.md) szól.
+  kerülnek, minden bájtsorozat átvészeli az oda-vissza utat a BPE-n. Egy ellenőrzőpont-fájlban
+  megbillent bitet észrevesz és megnevezi a fájlt, a bármikor megszakadt mentést pedig befejezi vagy
+  eldobja. Az ellenséges szemléletű auditról a [docs/AUDIT.md](docs/AUDIT.md) szól.
 
-## Korlátok (0.3-as verzió)
+## Korlátok (0.4-es verzió)
 
+* Az ellenőrző összegek a balesetek ellen védenek (megbillent bit, csonka fájl, két különböző mentés
+  fájljai), nem az ellen, aki a `meta.json`-t is át tudja írni; a 0.4 előtt írt ellenőrzőpontok nem
+  ellenőrizhetők.
 * A teljes korpusz beolvasásra kerül a memóriába (16 bites azonosítókként); a RAM-nál nagyobb,
   memóriába leképezett korpuszok tervben vannak.
 * Egyetlen gráfon belül a lépés néhány művelete (RMSNorm, forgó beágyazások, AdamW-frissítés) nem

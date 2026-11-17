@@ -48,10 +48,13 @@ germen train --data corpusul-meu.txt --preset mini --tokenizer bpe --vocab 4096 
 germen generate --model modelul-meu --prompt "Era odată " --max-new 400
 ```
 
-Apăsați **Ctrl-C** în timpul antrenării: termină pasul curent, salvează și iese. Reluați mai
-târziu cu aceeași comandă plus `--resume`: ponderile, contorul de pași și starea AdamW se
-restaurează, deci antrenarea continuă fără urcarea pierderii de la o repornire „la rece”
-(ferestrele de text se trag din nou la întâmplare).
+Apăsați **Ctrl-C** în timpul antrenării: termină pasul curent, salvează și iese. Reluați mai târziu
+cu aceeași comandă plus `--resume`: ponderile, contorul de pași și starea AdamW se restaurează, deci
+antrenarea continuă fără urcarea pierderii de la o repornire „la rece” (ferestrele de text se trag
+din nou la întâmplare).
+
+Aceeași comandă `train` rulată din nou, *fără* `--resume`, este refuzată, ca să nu înlocuiți din
+greșeală un model antrenat; `--overwrite` o permite când vreți să o luați de la capăt.
 
 ## Comenzi
 
@@ -62,6 +65,7 @@ restaurează, deci antrenarea continuă fără urcarea pierderii de la o reporni
 | `germen demo-corpus` | scrie un corpus sintetic românesc generat dintr-o gramatică mică (`--size-mb`) |
 | `germen train` | antrenează de la zero (`--data FIȘIER` sau `--demo`) sau continuă cu `--resume` |
 | `germen generate` | generează text dintr-un model antrenat, cu cache cheie/valoare (`--temperature`, `--top-k`, `--prompt`) |
+| `germen verify` | verifică un punct de control: mărimea și suma SHA-256 a fiecărui fișier față de `meta.json` (ce afișează `sha256sum`); `--recover` termină o salvare întreruptă, fără să aibă nevoie de text |
 
 Opțiuni de antrenare bune de știut: `--tokenizer byte|bpe` și `--vocab N` (mărimea BPE); `--batch`
 și `--accum` (acumulare de gradienți: lotul efectiv e produsul lor, memoria e doar cea a lui
@@ -153,19 +157,26 @@ crates/germen-cli    linia de comandă `germen` (clap)
   [docs/PLAN.md](docs/PLAN.md).
 * **Punctul de control** — un director cu `config.json`, `weights.bpk` (formatul burnpack al lui
   Burn, f32), `optimizer.bpk` (momentele AdamW), `tokenizer.json` și `meta.json`. Punctele de
-  control scrise de versiunea 0.1 se încarcă în continuare.
-* **Teste** — 117 de teste (unitare ale bibliotecii și ale liniei de comandă, plus rulări complete
+  control scrise de versiunea 0.1 se încarcă în continuare. De la 0.4, `meta.json` ține și mărimea
+  și suma SHA-256 ale celorlalte fișiere, verificate la fiecare încărcare: un fișier deteriorat,
+  trunchiat sau dintr-o altă salvare e numit în mesaj; cele mai vechi se încarcă fără verificare.
+* **Teste** — 156 de teste (unitare ale bibliotecii și ale liniei de comandă, plus rulări complete
   ale executabilului real), între care: atenția e cauzală, atenția pe blocuri e egală cu cea a lui
   Burn (valori și gradienți), generarea cu cache dă aceleași rezultate ca trecerea completă,
   micro-loturile acumulate echivalează cu un lot mare, replicile dau gradienții unui singur graf
   mare iar o rulare e reproductibilă bit cu bit, un pas de optimizare după reîncărcarea stării AdamW
   e egal cu cel al unei rulări neîntrerupte, un punct de control nu rămâne niciodată scris pe
   jumătate iar ponderile non-finite nu se salvează, fișierele ostile de tokenizator și de
-  configurare sunt respinse, orice șir de octeți supraviețuiește turului complet prin BPE. Auditul
-  adversarial e în [docs/AUDIT.md](docs/AUDIT.md).
+  configurare sunt respinse, orice șir de octeți supraviețuiește turului complet prin BPE. Un bit
+  schimbat într-un fișier al punctului de control e prins și fișierul e numit, iar o salvare
+  întreruptă oricând e terminată sau aruncată. Auditul adversarial e în
+  [docs/AUDIT.md](docs/AUDIT.md).
 
-## Limite (versiunea 0.3)
+## Limite (versiunea 0.4)
 
+* Sumele de control apără de accidente (un bit schimbat, un fișier trunchiat, fișiere din două
+  salvări diferite), nu de cineva care poate edita și `meta.json`; punctele de control scrise
+  înainte de 0.4 nu pot fi verificate.
 * Tot corpusul se citește în memorie (ca identificatori de 16 biți); corpusuri mapate în memorie,
   mai mari decât RAM-ul, sunt planificate.
 * Într-un singur graf, câteva operații ale pasului (RMSNorm, embeddingurile rotative, actualizarea

@@ -10,6 +10,7 @@ repository.workspace = true
 
 [dependencies]
 burn = { workspace = true }
+burn-pack = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 rayon = { workspace = true }

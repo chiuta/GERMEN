@@ -31,6 +31,30 @@ fn assert_refused(out: &Output, needle: &str) {
     assert!(!err.contains("panicked"), "stderr: {err}");
 }
 
+/// Rewrites `meta.json` without its manifest, which is what a checkpoint of 0.3.0 or before
+/// looks like.
+fn strip_manifest(dir: &Path) {
+    let path = dir.join("meta.json");
+    let mut meta: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    meta.as_object_mut()
+        .unwrap()
+        .remove("files")
+        .expect("a checkpoint of this version has a manifest");
+    std::fs::write(&path, serde_json::to_vec_pretty(&meta).unwrap()).unwrap();
+}
+
+/// Copies the files of a checkpoint directory (not its lock file).
+fn copy_checkpoint(from: &Path, to: &Path) {
+    std::fs::create_dir_all(to).unwrap();
+    for entry in std::fs::read_dir(from).unwrap() {
+        let entry = entry.unwrap();
+        if entry.file_name() != ".germen.lock" && entry.path().is_file() {
+            std::fs::copy(entry.path(), to.join(entry.file_name())).unwrap();
+        }
+    }
+}
+
 fn train_args<'a>(out: &'a str, extra: &[&'a str]) -> Vec<&'a str> {
     let mut args = vec![
         "train",
@@ -186,6 +210,17 @@ fn a_hostile_tokenizer_file_is_an_error_not_an_out_of_memory_kill() {
     );
     std::fs::write(dir.join("tokenizer.json"), json).unwrap();
 
+    // The manifest names the edited file before anything in it is read…
+    let caught = germen(&["generate", "--model", out, "--max-new", "3"]);
+    assert_refused(&caught, "tokenizer.json");
+    assert!(
+        text(&caught.stderr).contains("meta.json"),
+        "{}",
+        text(&caught.stderr)
+    );
+
+    // …and without one (a checkpoint of 0.3.0 or before) the tokenizer's own checks stand guard.
+    strip_manifest(&dir);
     assert_refused(
         &germen(&["generate", "--model", out, "--max-new", "3"]),
         "octeți",
@@ -212,4 +247,206 @@ fn a_model_with_nan_weights_is_refused() {
         text(&result.stderr)
     );
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn verify_vouches_for_a_checkpoint_and_names_the_file_that_is_wrong() {
+    let dir = scratch("verify");
+    let out = dir.to_str().unwrap();
+    let first = germen(&train_args(out, &["--steps", "1", "--save-every", "0"]));
+    assert!(first.status.success(), "{}", text(&first.stderr));
+
+    let good = germen(&["verify", out]);
+    assert!(good.status.success(), "{}", text(&good.stderr));
+    let report = text(&good.stdout);
+    for name in [
+        "weights.bpk",
+        "config.json",
+        "tokenizer.json",
+        "optimizator",
+    ] {
+        assert!(report.contains(name), "{name} is missing from: {report}");
+    }
+    assert!(report.contains("SHA-256 corect"), "{report}");
+
+    // One flipped bit in the weights, and the report says which file, instead of a failure
+    // somewhere deep in the loader (or, worse, a model that quietly generates something else).
+    let weights = dir.join("weights.bpk");
+    let mut bytes = std::fs::read(&weights).unwrap();
+    let last = bytes.len() - 1;
+    bytes[last] ^= 1;
+    std::fs::write(&weights, bytes).unwrap();
+    assert_refused(&germen(&["verify", out]), "weights.bpk");
+    assert_refused(
+        &germen(&["generate", "--model", out, "--max-new", "3"]),
+        "weights.bpk",
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_checkpoint_of_the_old_format_still_loads_and_says_it_cannot_be_vouched_for() {
+    let dir = scratch("legacy");
+    let out = dir.to_str().unwrap();
+    let first = germen(&train_args(out, &["--steps", "1", "--save-every", "0"]));
+    assert!(first.status.success(), "{}", text(&first.stderr));
+    strip_manifest(&dir);
+
+    let result = germen(&["generate", "--model", out, "--max-new", "3"]);
+    assert!(result.status.success(), "{}", text(&result.stderr));
+    assert!(
+        text(&result.stderr).contains("nu poate fi verificat"),
+        "{}",
+        text(&result.stderr)
+    );
+    // `verify` has nothing to check it against, and says so with an error rather than a "fine".
+    assert_refused(&germen(&["verify", out]), "meta.json");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_fresh_run_does_not_silently_replace_a_checkpoint() {
+    let dir = scratch("overwrite");
+    let out = dir.to_str().unwrap();
+    let first = germen(&train_args(out, &["--steps", "1", "--save-every", "0"]));
+    assert!(first.status.success(), "{}", text(&first.stderr));
+    let weights = dir.join("weights.bpk");
+    let before = std::fs::read(&weights).unwrap();
+
+    // The same command again used to replace the trained model at its first save, without a word.
+    let again = germen(&train_args(
+        out,
+        &["--steps", "1", "--save-every", "0", "--seed", "99"],
+    ));
+    assert_refused(&again, "--overwrite");
+    assert_eq!(
+        std::fs::read(&weights).unwrap(),
+        before,
+        "not a byte changed"
+    );
+
+    // Asked for in so many words, it does.
+    let forced = germen(&train_args(
+        out,
+        &[
+            "--steps",
+            "1",
+            "--save-every",
+            "0",
+            "--seed",
+            "99",
+            "--overwrite",
+        ],
+    ));
+    assert!(forced.status.success(), "{}", text(&forced.stderr));
+    assert_ne!(std::fs::read(&weights).unwrap(), before);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_text_larger_than_memory_is_refused_before_it_is_read() {
+    // A sparse file twice as large as the memory the system has free: nothing is written to disk
+    // to make it, and reading it could only end in an out-of-memory error or a killed process.
+    let Some(available) = germen_core::sys::available_memory_bytes() else {
+        return;
+    };
+    let dir = scratch("huge-text");
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("huge.txt");
+    let created = std::fs::File::create(&file)
+        .and_then(|f| f.set_len(available.saturating_mul(2).max(1 << 30)));
+    if created.is_err() {
+        // A file system that cannot hold a file that large (even sparse): nothing to test here.
+        let _ = std::fs::remove_dir_all(&dir);
+        return;
+    }
+    let model = dir.join("model");
+    let started = std::time::Instant::now();
+    let out = germen(&[
+        "train",
+        "--data",
+        file.to_str().unwrap(),
+        "--steps",
+        "1",
+        "--out",
+        model.to_str().unwrap(),
+    ]);
+    assert_refused(&out, "limita acceptată");
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(10),
+        "the refusal must come before the file is read, not after"
+    );
+    assert!(!model.exists(), "a refused run leaves nothing behind");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_save_cut_off_between_two_renames_is_refused_with_a_remedy_and_completed_by_verify_recover() {
+    // What a power cut leaves in the middle of publishing a save: the files of the new save are
+    // either already in place (tokenizer, optimizer, weights) or waiting under their temporary
+    // names (configuration, progress record), while the progress record that vouches for the
+    // files is still the old one.
+    let old = scratch("cut-old");
+    let newer = scratch("cut-new");
+    let torn = scratch("cut-torn");
+    let out = old.to_str().unwrap();
+    let first = germen(&train_args(out, &["--steps", "1", "--save-every", "0"]));
+    assert!(first.status.success(), "{}", text(&first.stderr));
+    copy_checkpoint(&old, &newer);
+    let second = germen(&train_args(
+        newer.to_str().unwrap(),
+        &["--steps", "2", "--save-every", "0", "--resume"],
+    ));
+    assert!(second.status.success(), "{}", text(&second.stderr));
+
+    copy_checkpoint(&old, &torn);
+    for name in ["tokenizer.json", "optimizer.bpk", "weights.bpk"] {
+        std::fs::copy(newer.join(name), torn.join(name)).unwrap();
+    }
+    for name in ["config.json", "meta.json"] {
+        std::fs::copy(newer.join(name), torn.join(format!("{name}.tmp"))).unwrap();
+    }
+    let torn_dir = torn.to_str().unwrap();
+
+    // Both commands refuse the mixture, and both say how to put it right.
+    assert_refused(
+        &germen(&["generate", "--model", torn_dir, "--max-new", "3"]),
+        "verify --recover",
+    );
+    assert_refused(&germen(&["verify", torn_dir]), "verify --recover");
+
+    // The remedy needs no text to train on, and leaves the set the new save would have made.
+    let fixed = germen(&["verify", torn_dir, "--recover"]);
+    assert!(fixed.status.success(), "{}", text(&fixed.stderr));
+    assert!(
+        text(&fixed.stdout).contains("am terminat-o"),
+        "{}",
+        text(&fixed.stdout)
+    );
+    for name in [
+        "tokenizer.json",
+        "optimizer.bpk",
+        "weights.bpk",
+        "config.json",
+        "meta.json",
+    ] {
+        assert_eq!(
+            std::fs::read(torn.join(name)).unwrap(),
+            std::fs::read(newer.join(name)).unwrap(),
+            "{name}"
+        );
+    }
+    let generated = germen(&["generate", "--model", torn_dir, "--max-new", "3"]);
+    assert!(generated.status.success(), "{}", text(&generated.stderr));
+    let again = germen(&["verify", torn_dir, "--recover"]);
+    assert!(again.status.success());
+    assert!(
+        text(&again.stdout).contains("Nicio salvare întreruptă"),
+        "{}",
+        text(&again.stdout)
+    );
+    for dir in [&old, &newer, &torn] {
+        let _ = std::fs::remove_dir_all(dir);
+    }
 }

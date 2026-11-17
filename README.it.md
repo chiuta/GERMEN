@@ -48,10 +48,13 @@ germen train --data il-mio-corpus.txt --preset mini --tokenizer bpe --vocab 4096
 germen generate --model il-mio-modello --prompt "Era odată " --max-new 400
 ```
 
-Premete **Ctrl-C** durante l'addestramento: termina il passo in corso, salva ed esce. Riprendete
-più tardi con lo stesso comando più `--resume`: pesi, contatore dei passi e stato di AdamW vengono
-ripristinati, quindi l'addestramento prosegue senza il rialzo della perdita di un riavvio a
-freddo (le finestre di testo vengono estratte di nuovo a caso).
+Premete **Ctrl-C** durante l'addestramento: termina il passo in corso, salva ed esce. Riprendete più
+tardi con lo stesso comando più `--resume`: pesi, contatore dei passi e stato di AdamW vengono
+ripristinati, quindi l'addestramento prosegue senza il rialzo della perdita di un riavvio a freddo
+(le finestre di testo vengono estratte di nuovo a caso).
+
+Lo stesso comando `train` rilanciato *senza* `--resume` viene rifiutato, perché non sostituisca per
+errore un modello addestrato; `--overwrite` lo consente quando si vuole davvero ricominciare.
 
 ## Comandi
 
@@ -62,6 +65,7 @@ freddo (le finestre di testo vengono estratte di nuovo a caso).
 | `germen demo-corpus` | scrive un corpus rumeno sintetico generato da una piccola grammatica (`--size-mb`) |
 | `germen train` | addestra da zero (`--data FILE` oppure `--demo`), o continua con `--resume` |
 | `germen generate` | genera testo da un modello addestrato, con una cache chiave/valore (`--temperature`, `--top-k`, `--prompt`) |
+| `germen verify` | controlla un checkpoint: dimensione e SHA-256 di ogni file rispetto a `meta.json` (quello che stampa `sha256sum`); `--recover` completa un salvataggio interrotto, senza bisogno di alcun testo |
 
 Opzioni di addestramento da conoscere: `--tokenizer byte|bpe` e `--vocab N` (la dimensione del BPE);
 `--batch` e `--accum` (accumulo del gradiente: il batch effettivo è il loro prodotto, la memoria è
@@ -152,10 +156,12 @@ crates/germen-cli    la riga di comando `germen` (clap)
   del modello, con un picco di memoria più basso; `--replicas 1` dà il passo ordinario). Distribuire
   i micro-batch su thread che condividevano tutti un solo grafo è stato provato nella 0.2 e
   scartato; vedere [docs/PLAN.md](docs/PLAN.md).
-* **Checkpoint** — una cartella con `config.json`, `weights.bpk` (il formato burnpack di Burn,
-  f32), `optimizer.bpk` (i momenti di AdamW), `tokenizer.json` e `meta.json`. I checkpoint
-  scritti dalla versione 0.1 si caricano ancora.
-* **Test** — 117 test (unitari della libreria e della riga di comando, più esecuzioni complete del
+* **Checkpoint** — una cartella con `config.json`, `weights.bpk` (il formato burnpack di Burn, f32),
+  `optimizer.bpk` (i momenti di AdamW), `tokenizer.json` e `meta.json`. I checkpoint scritti dalla
+  versione 0.1 si caricano ancora. Dalla 0.4 `meta.json` registra anche dimensione e SHA-256 degli
+  altri file, controllati a ogni caricamento: un file danneggiato, troncato o di un altro
+  salvataggio viene nominato nell'errore; quelli più vecchi si caricano senza controllo.
+* **Test** — 156 test (unitari della libreria e della riga di comando, più esecuzioni complete del
   binario vero), tra cui: l'attenzione è causale, l'attenzione a blocchi è uguale a quella di Burn
   (valori e gradienti), la generazione con cache è uguale al passaggio completo, i micro-batch
   accumulati equivalgono a un batch grande, le repliche danno i gradienti di un solo grande grafo e
@@ -163,10 +169,15 @@ crates/germen-cli    la riga di comando `germen` (clap)
   stato di AdamW è uguale a quello di un addestramento ininterrotto, un checkpoint non resta mai
   scritto a metà e i pesi non finiti non vengono mai salvati, i file ostili di tokenizer e
   configurazione vengono rifiutati, ogni sequenza di byte sopravvive all'andata e ritorno col BPE.
-  L'audit avversariale è in [docs/AUDIT.md](docs/AUDIT.md).
+  Un bit cambiato in un file del checkpoint viene intercettato e il file nominato, e un salvataggio
+  interrotto in qualsiasi momento viene completato o scartato. L'audit avversariale è in
+  [docs/AUDIT.md](docs/AUDIT.md).
 
-## Limiti (versione 0.3)
+## Limiti (versione 0.4)
 
+* Le somme di controllo proteggono dagli incidenti (un bit cambiato, un file troncato, file di due
+  salvataggi diversi), non da chi può modificare anche `meta.json`; i checkpoint scritti prima della
+  0.4 non si possono verificare.
 * L'intero corpus viene letto in memoria (come identificatori a 16 bit); sono previsti corpus
   mappati in memoria più grandi della RAM.
 * In un singolo grafo alcune operazioni del passo (RMSNorm, embedding rotatori, aggiornamento di

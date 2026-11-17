@@ -50,8 +50,11 @@ germen generate --model mon-modele --prompt "Era odată " --max-new 400
 
 Appuyez sur **Ctrl-C** pendant l'entraînement : il termine le pas en cours, enregistre et s'arrête.
 Reprenez plus tard avec la même commande plus `--resume` : les poids, le compteur de pas et l'état
-d'AdamW sont restaurés, l'entraînement continue donc sans la remontée de la perte d'un redémarrage
-à froid (les fenêtres de texte sont tirées à nouveau au hasard).
+d'AdamW sont restaurés, l'entraînement continue donc sans la remontée de la perte d'un redémarrage à
+froid (les fenêtres de texte sont tirées à nouveau au hasard).
+
+La même commande `train` relancée *sans* `--resume` est refusée, pour qu'elle ne remplace pas un
+modèle entraîné par erreur ; `--overwrite` l'autorise quand on veut vraiment repartir de zéro.
 
 ## Commandes
 
@@ -62,6 +65,7 @@ d'AdamW sont restaurés, l'entraînement continue donc sans la remontée de la p
 | `germen demo-corpus` | écrit un corpus roumain synthétique généré à partir d'une petite grammaire (`--size-mb`) |
 | `germen train` | entraîne à partir de zéro (`--data FICHIER` ou `--demo`), ou continue avec `--resume` |
 | `germen generate` | génère du texte à partir d'un modèle entraîné, avec un cache clé/valeur (`--temperature`, `--top-k`, `--prompt`) |
+| `germen verify` | vérifie un point de contrôle : la taille et le SHA-256 de chaque fichier d'après `meta.json` (ce qu'affiche `sha256sum`) ; `--recover` termine une sauvegarde interrompue, sans avoir besoin d'aucun texte |
 
 Options d'entraînement à connaître : `--tokenizer byte|bpe` et `--vocab N` (la taille du BPE) ;
 `--batch` et `--accum` (accumulation de gradients : le lot effectif est leur produit, la mémoire est
@@ -155,8 +159,11 @@ crates/germen-cli    la ligne de commande `germen` (clap)
   partageant tous un même graphe a été essayé en 0.2 et rejeté ; voir [docs/PLAN.md](docs/PLAN.md).
 * **Point de contrôle** — un dossier avec `config.json`, `weights.bpk` (le format burnpack de Burn,
   f32), `optimizer.bpk` (les moments d'AdamW), `tokenizer.json` et `meta.json`. Les points de
-  contrôle écrits par la version 0.1 se chargent toujours.
-* **Tests** — 117 tests (unitaires de la bibliothèque et de la ligne de commande, plus des
+  contrôle écrits par la version 0.1 se chargent toujours. Depuis la 0.4, `meta.json` consigne aussi
+  la taille et le SHA-256 des autres fichiers, vérifiés à chaque chargement : un fichier abîmé,
+  tronqué ou issu d'une autre sauvegarde est nommé dans l'erreur ; les plus anciens se chargent sans
+  vérification.
+* **Tests** — 156 tests (unitaires de la bibliothèque et de la ligne de commande, plus des
   exécutions complètes du vrai binaire), dont : l'attention est causale, l'attention par blocs égale
   celle de Burn (valeurs et gradients), la génération avec cache égale la passe complète, des
   micro-lots accumulés valent un grand lot, les répliques donnent les gradients d'un seul grand
@@ -164,10 +171,15 @@ crates/germen-cli    la ligne de commande `germen` (clap)
   l'état d'AdamW égale celui d'un entraînement ininterrompu, un point de contrôle n'est jamais
   laissé à moitié écrit et des poids non finis ne sont jamais enregistrés, les fichiers hostiles de
   tokenizer et de configuration sont refusés, toute suite d'octets survit à l'aller-retour par le
-  BPE. L'audit adversarial est dans [docs/AUDIT.md](docs/AUDIT.md).
+  BPE. Un bit modifié dans un fichier du point de contrôle est détecté et le fichier nommé, et une
+  sauvegarde interrompue à n'importe quel moment est terminée ou abandonnée. L'audit adversarial est
+  dans [docs/AUDIT.md](docs/AUDIT.md).
 
-## Limites (version 0.3)
+## Limites (version 0.4)
 
+* Les sommes de contrôle protègent des accidents (un bit modifié, un fichier tronqué, des fichiers
+  de deux sauvegardes différentes), pas de quelqu'un qui peut aussi modifier `meta.json` ; les
+  points de contrôle écrits avant la 0.4 ne peuvent pas être vérifiés.
 * Tout le corpus est lu en mémoire (sous forme d'identifiants de 16 bits) ; des corpus mappés en
   mémoire, plus grands que la RAM, sont prévus.
 * Dans un seul graphe, quelques opérations du pas (RMSNorm, embeddings rotatifs, mise à jour
