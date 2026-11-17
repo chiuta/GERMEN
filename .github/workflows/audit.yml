@@ -2,15 +2,17 @@ name: Dependency audit
 
 # Checks Cargo.lock against the RustSec advisory database. It runs weekly and whenever the
 # dependencies change, apart from the main CI so that a new advisory never blocks an unrelated push.
+# Cargo.lock also lists crates that are never compiled (optional backends of Burn's sub-crates), so
+# the verdict comes from scripts/audit_graph.py, which keeps only advisories about compiled crates.
 on:
   schedule:
     - cron: "23 5 * * 1"
   workflow_dispatch:
   push:
     branches: [main]
-    paths: ["Cargo.lock", "**/Cargo.toml", ".github/workflows/audit.yml"]
+    paths: ["Cargo.lock", "**/Cargo.toml", ".github/workflows/audit.yml", "scripts/audit_graph.py"]
   pull_request:
-    paths: ["Cargo.lock", "**/Cargo.toml", ".github/workflows/audit.yml"]
+    paths: ["Cargo.lock", "**/Cargo.toml", ".github/workflows/audit.yml", "scripts/audit_graph.py"]
 
 permissions:
   contents: read
@@ -28,4 +30,8 @@ jobs:
       - name: Install cargo-audit
         run: cargo install cargo-audit --locked
       - name: Audit Cargo.lock
-        run: cargo audit
+        run: |
+          cargo audit || true              # the full report, for people to read
+          cargo audit --json > audit.json || true
+      - name: Keep the advisories that reach the binary
+        run: python3 scripts/audit_graph.py audit.json

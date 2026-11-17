@@ -59,7 +59,7 @@ in question was already in 0.2.0, which was not run against it).
 | A-17 | Medium | the "will it fit in memory" check answers only on Linux: on Windows and macOS (the platforms GERMEN is released for) it limits nothing but a fixed 256 GiB | I | Windows and macOS probes |
 | A-18 | Low | on Windows a save fails when an antivirus scanner or the indexer still holds a file that was just written | I | the rename is retried for about 10 s on Windows |
 | A-19 | Low | `rust-version = "1.95"` in `Cargo.toml` is checked by nothing | I | CI job `msrv` |
-| A-20 | Low | no scan of the ≈ 780 locked crates for known vulnerabilities | I | weekly `audit.yml` |
+| A-20 | Low | no scan of the ≈ 780 locked crates for known vulnerabilities | I | weekly `audit.yml`, judging the crates that are compiled |
 | A-21 | Info | `unsafe` was not forbidden | I | `#![deny(unsafe_code)]`; one allowed FFI call |
 | A-22 | Low | no test ran the real binary: exit codes and messages were untested | I | 7 end-to-end tests |
 | A-23 | Info | documentation drift: the module documentation of `generate.rs` still said there is no key/value cache (0.2 added one) | I | corrected |
@@ -216,6 +216,29 @@ suite ran 40 times in a row in parallel mode without a failure. Limits: the lock
 draws; a program that seeds or draws from the same Burn device itself is not covered. 0.2.0 has the
 same pattern; it was not run against this test.
 
+**The first run of the dependency audit (A-20).** On the pushed 0.3.0 commit `cargo audit` (1,527
+advisories, 786 crates in `Cargo.lock`) reported 7 vulnerabilities — six in `zip` 0.6.6 and one in
+`zstd-safe` 5.0.2 — and 10 warnings: eight more `zstd-safe` advisories marked unsound, and `chrono`
+and `paste` unmaintained. The job failed. None of the vulnerable crates is compiled: `zip` is used
+only by `tch`, the LibTorch binding behind Burn's optional `burn-tch` backend, `zstd-safe` only
+through `zip`, and `chrono` only through `turso`, an optional dependency of `cubecl-environment`.
+`cargo tree --target all` reaches none of them, and a release build leaves no artifact of them in
+`target/release/deps`; `Cargo.lock` lists them because it records the optional dependencies of
+Burn's sub-crates, not only what is switched on. `paste` is compiled (a proc-macro used by
+`burn-dispatch`, `gemm`, `pulp` and `macerator`); it is unmaintained and has no fixed version, which
+is a notice, not a vulnerability.
+
+Rather than switch the check off, or list ten advisory IDs to ignore, the workflow keeps the full
+report for people to read and takes its verdict from `scripts/audit_graph.py`: a vulnerability or an
+*unsound* warning about a compiled crate fails the job; other notices about compiled crates are
+listed; advisories about crates that are only in the lock file are listed as such; and a report the
+script cannot read ends with exit code 2, so that a broken check never passes as a clean one. The
+script was tried with the real cargo-audit 0.23.0 against five hand-made advisory databases (only
+never-compiled crates: pass; a compiled crate with an unmaintained notice: pass, notice printed; a
+compiled crate with an unsound advisory, or with a vulnerability: fail; no advisory at all: pass)
+and against an empty, a malformed and a missing report (exit 2). The real database cannot be reached
+from the sandbox, so the corrected workflow's own run is its first test against it.
+
 **Added without a finding.** `damaged_weight_files_are_errors_not_crashes` (six kinds of damaged
 `weights.bpk`) and `a_run_with_a_tiny_context_still_ends_with_its_sample` are regression tests that
 revealed no defect in the current code; they were not run against 0.2.0.
@@ -348,6 +371,8 @@ element-wise operations around them run on one thread, which is what replicas hi
   with different core counts (the order of floating-point sums differs), and not between 0.2 and 0.3.
   It also assumes that nothing outside GERMEN draws from the same Burn device while a model is being
   initialised (A-24).
+* **The dependency check judges the default build.** Someone who builds with another Burn backend
+  (LibTorch, say) compiles crates that the check ignores (A-20).
 
 ## 5. What has not been verified
 
@@ -356,7 +381,9 @@ element-wise operations around them run on one thread, which is what replicas hi
   and will show failures; it cannot show what an antivirus does.
 * The build with Rust 1.95: the sandbox has 1.97, so the new `msrv` job is the first test of the
   promise in `Cargo.toml`.
-* `audit.yml` has not run yet; the third-party GitHub Actions are pinned by tag, not by commit hash.
+* `audit.yml` failed on its first run for the reason given under A-20; the corrected version has
+  been tried only with hand-made advisories. The third-party GitHub Actions are pinned by tag, not
+  by commit hash.
 * A bigger machine (§3.3), and a release build on any machine but this one.
 
 ## 6. Reproducing this audit
@@ -366,6 +393,8 @@ cargo build --release
 # every finding that has a command-line trigger, against the new build and an old one:
 python3 scripts/audit_repro.py --new target/release/germen --old /path/to/germen-0.2.0
 python3 scripts/audit_repro.py --new target/release/germen A-06 A-07     # only some
+# the dependency audit as CI runs it (needs `cargo install cargo-audit`):
+cargo audit --json > audit.json; python3 scripts/audit_graph.py audit.json
 # library-level findings (copy the file into the examples folder of an old tree to compare):
 cargo run --release -p germen-core --example audit_lib
 # speed: interleaved A/B of the real command

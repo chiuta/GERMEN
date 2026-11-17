@@ -34,7 +34,10 @@ that much lower — so compare the ratios, not the 0.2 figures.)
   against any `germen` binary) and `examples/audit_lib.rs` (the library-level ones).
 - Seven end-to-end tests of the real binary (`crates/germen-cli/tests/cli.rs`): 117 tests in all.
 - CI: a job that builds with the minimum supported Rust (1.95), concurrency control, smoke runs
-  with `--replicas 1` and `--replicas 3`, and a weekly RustSec advisory scan (`audit.yml`).
+  with `--replicas 1` and `--replicas 3`, and a weekly RustSec advisory scan (`audit.yml`) whose
+  verdict (`scripts/audit_graph.py`) counts only advisories about crates that are really compiled:
+  `Cargo.lock` also lists crates that are never built — Burn's optional LibTorch backend brings in
+  `zip` and `zstd-safe`, which carry seven open advisories today (A-20).
 - API: `Batch::split`, `GptConfig::init_seeded`, `Gpt::init_parameters`, `checkpoint::save_all`,
   `checkpoint::ensure_finite`, `GptConfig::estimate_train_bytes_replicated`, `train::plan_replicas`,
   `sys::memory_limit_bytes`.
