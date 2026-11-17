@@ -1,0 +1,6 @@
+/target
+/germen-model/
+/ci-model/
+*.bpk
+/demo.txt
+/bench*.json

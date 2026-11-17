@@ -1,0 +1,19 @@
+[package]
+name = "germen-cli"
+description = "GERMEN: linie de comandă pentru antrenarea și măsurarea unui model de limbaj mic"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "germen"
+path = "src/main.rs"
+
+[dependencies]
+germen-core = { path = "../germen-core" }
+clap = { workspace = true }
+serde_json = { workspace = true }
+ctrlc = { workspace = true }

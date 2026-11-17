@@ -1,0 +1,30 @@
+[workspace]
+resolver = "2"
+members = ["crates/germen-core", "crates/germen-cli"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+license = "MIT"
+authors = ["Alexio <alexio@trom.tf>"]
+repository = "https://github.com/chiuta/GERMEN"
+
+[workspace.dependencies]
+burn = { version = "=0.22.1", features = ["flex"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+clap = { version = "4", features = ["derive"] }
+rayon = "1"
+ctrlc = "3"
+
+[profile.release]
+opt-level = 3
+debug = false
+
+# Profil pentru binarele distribuite (CI și compilări încrucișate): mai lent de compilat, mai rapid la rulare.
+[profile.dist]
+inherits = "release"
+lto = "fat"
+codegen-units = 1
+strip = true
