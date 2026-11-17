@@ -68,8 +68,8 @@ longer replaces an existing checkpoint, and `--resume` needs `meta.json`.
 
 ### Performance
 Nothing on the training path changed (`bench` on `nano`: 0.52 s against 0.51 s). The price of the
-manifest, on a `base` checkpoint of 1 GB: loading for `generate` costs 0.27 s more (0.34 s →
-0.61 s, with the same peak memory), `germen verify` takes 2.3 s, and the save is not measurably
+manifest, on a `base` checkpoint of 1 GB: loading for `generate` costs about 0.27 s more (0.34 s →
+0.61 s, with the same peak memory), `germen verify` takes 2.3–2.8 s, and the save is not measurably
 slower. With the portable SHA-256 alone `germen verify` of the same checkpoint took 6.5 s.
 
 ### Measured and not done

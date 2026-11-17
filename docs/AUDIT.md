@@ -570,21 +570,23 @@ implementation, the textbook one in safe Rust, ran at about 205 MB/s here, which
 verify` of a 1 GB checkpoint (the `base` preset: 341 MB of weights and 683 MB of optimizer state)
 take 6.5 s (measured), and would make loading the model for `generate` about 1.5 s slower (computed
 from the speed, not measured). Two steps were measured, each on 64 MiB, best of four, in turns, in
-two separate runs:
+four runs of the final code:
 
 | version | speed | against the textbook |
 |---|---|---|
-| textbook (64-word schedule, shuffled variables) | 200–213 MB/s | 1.0× |
-| portable, unrolled (16-word window, rotated names) | 234–240 MB/s | 1.1–1.2× |
-| the SHA instructions of the processor (x86-64, found at run time) | 1,310–1,317 MB/s | 6.2–6.6× |
+| textbook (64-word schedule, shuffled variables) | 200–212 MB/s | 1.0× |
+| portable, unrolled (16-word window, rotated names) | 221–240 MB/s | 1.1–1.2× |
+| the SHA instructions of the processor (x86-64, found at run time) | 1,277–1,282 MB/s | 6.0–6.4× |
 
-The last is as fast as `sha256sum` on the same machine (1.02 GB in 0.87 s, reading included). With
-it, on the `base` checkpoint: `germen verify` takes 2.3 s (hashing is now about 0.8 s of it; the
-rest is loading and checking the tensors); loading for `generate` costs 0.27 s more than in 0.3.0 (0.34 s
-→ 0.61 s, four interleaved pairs) with the same peak memory, because the file is hashed in pieces
-of 1 MiB; and a one-step `base` training run including its final save of 977 MB took 12.7 s against
-13.1 s for 0.3.0 (three pairs, ranges overlapping: no measurable cost). `bench` on `nano` is
-unchanged (0.52 s against 0.51 s over four pairs).
+The last is as fast as `sha256sum` on the same machine (1.02 GB in 0.87–0.97 s, reading included,
+in two sessions). With it, on the `base` checkpoint: `germen verify` takes 2.3–2.8 s in those two
+sessions (hashing is about 0.8 s of it; the rest is loading and checking the tensors; the machine is
+shared, so the second session was slower throughout, `sha256sum` included); loading for `generate`
+costs 0.26–0.27 s more than in 0.3.0 (0.34 s → 0.61 s and 0.38 s → 0.64 s, four interleaved pairs
+each) with the same peak memory, because the file is hashed in pieces of 1 MiB; and a one-step
+`base` training run including its final save of 977 MB took 12.7 s against 13.1 s for 0.3.0 (three
+pairs, ranges overlapping: no measurable cost). `bench` on `nano` is unchanged (0.52 s against
+0.51 s over four pairs).
 
 **Tried and not done.**
 * *The `sha2` crate* would have added seven crates to the build for something the in-house version
@@ -623,9 +625,12 @@ unchanged (0.52 s against 0.51 s over four pairs).
 
 ## 11. What has not been verified
 
-* **CI.** At the time of writing the 0.4.0 workflow had not run on GitHub: the Windows and macOS
-  runs, which include the new smoke steps (`verify`, the refusal of a fresh run, `--overwrite`), the
-  memory-probe test on each system and the job with Rust 1.95, are the next thing to check.
+* **CI.** The first push of 0.4.0 (`25c666b`) passed every test job: Ubuntu 26.04, Windows and
+  macOS (all 156 tests and the smoke run with `verify`, the refusal of a fresh run and
+  `--overwrite`), the build with Rust 1.95, and the dependency audit. The lint job failed: CI
+  installs the newest stable Rust (1.100 that day), whose clippy has a lint
+  (`chunks_exact_to_as_chunks`) that the 1.97 used here does not, and `integrity.rs` had ten
+  fixed-size `chunks_exact` loops. They use `as_chunks` now. Lint with the toolchain CI uses.
 * **The SHA instructions on any processor but the one used here**, and the portable version on a
   real ARM machine (it is tested on this one by calling it directly).
 * **Windows and macOS under a crash.** The torn-save tests construct the state of a cut-off save by

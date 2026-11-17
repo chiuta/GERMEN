@@ -61,11 +61,11 @@ macro_rules! round {
 /// because every load of a checkpoint hashes all of its files.
 fn compress(state: &mut [u32; 8], block: &[u8; 64]) {
     let mut w = [0u32; 16];
-    for (word, bytes) in w.iter_mut().zip(block.chunks_exact(4)) {
-        *word = u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+    for (word, bytes) in w.iter_mut().zip(block.as_chunks::<4>().0) {
+        *word = u32::from_be_bytes(*bytes);
     }
     let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut h] = *state;
-    for (group, k) in K.chunks_exact(16).enumerate() {
+    for (group, k) in K.as_chunks::<16>().0.iter().enumerate() {
         if group > 0 {
             // W[t] = W[t-16] + s0(W[t-15]) + W[t-7] + s1(W[t-2]), in place: the slot of W[t-16] is
             // the slot of W[t], and the slots the other three words live in, `(t+1)`, `(t+9)` and
@@ -81,7 +81,7 @@ fn compress(state: &mut [u32; 8], block: &[u8; 64]) {
                     .wrapping_add(s1);
             }
         }
-        for (k, w) in k.chunks_exact(8).zip(w.chunks_exact(8)) {
+        for (k, w) in k.as_chunks::<8>().0.iter().zip(w.as_chunks::<8>().0) {
             round!(a, b, c, d, e, f, g, h, k[0].wrapping_add(w[0]));
             round!(h, a, b, c, d, e, f, g, k[1].wrapping_add(w[1]));
             round!(g, h, a, b, c, d, e, f, k[2].wrapping_add(w[2]));
@@ -128,8 +128,8 @@ impl Backend {
         debug_assert_eq!(blocks.len() % 64, 0);
         match self {
             Backend::Portable => {
-                for block in blocks.chunks_exact(64) {
-                    compress(state, block.try_into().expect("chunks of 64 bytes"));
+                for block in blocks.as_chunks::<64>().0 {
+                    compress(state, block);
                 }
             }
             #[cfg(target_arch = "x86_64")]
@@ -207,9 +207,10 @@ mod shani {
         let mut abef = _mm_alignr_epi8::<8>(cdab, efgh);
         let mut cdgh = _mm_blend_epi16::<0xF0>(efgh, cdab);
 
-        for block in blocks.chunks_exact(64) {
+        for block in blocks.as_chunks::<64>().0 {
             let (abef_before, cdgh_before) = (abef, cdgh);
-            let half = |i: usize| u64::from_le_bytes(block[8 * i..8 * i + 8].try_into().unwrap());
+            let halves = block.as_chunks::<8>().0;
+            let half = |i: usize| u64::from_le_bytes(halves[i]);
             let mut w0 = _mm_shuffle_epi8(_mm_set_epi64x(half(1) as i64, half(0) as i64), swap);
             let mut w1 = _mm_shuffle_epi8(_mm_set_epi64x(half(3) as i64, half(2) as i64), swap);
             let mut w2 = _mm_shuffle_epi8(_mm_set_epi64x(half(5) as i64, half(4) as i64), swap);
@@ -328,8 +329,8 @@ impl Sha256 {
         self.update(&padding[..1 + zeros + 8]);
         debug_assert_eq!(self.filled, 0);
         let mut out = [0u8; 32];
-        for (chunk, word) in out.chunks_exact_mut(4).zip(self.state) {
-            chunk.copy_from_slice(&word.to_be_bytes());
+        for (chunk, word) in out.as_chunks_mut::<4>().0.iter_mut().zip(self.state) {
+            *chunk = word.to_be_bytes();
         }
         out
     }
@@ -393,8 +394,8 @@ mod tests {
     /// variables. It is what `compress` was before it was unrolled, kept as the oracle.
     fn compress_reference(state: &mut [u32; 8], block: &[u8; 64]) {
         let mut w = [0u32; 64];
-        for (word, bytes) in w.iter_mut().zip(block.chunks_exact(4)) {
-            *word = u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+        for (word, bytes) in w.iter_mut().zip(block.as_chunks::<4>().0) {
+            *word = u32::from_be_bytes(*bytes);
         }
         for i in 16..64 {
             let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
@@ -454,15 +455,15 @@ mod tests {
             }
             let blocks = 1 + (next() % 6) as usize;
             let mut data = vec![0u8; 64 * blocks];
-            for chunk in data.chunks_exact_mut(8) {
-                chunk.copy_from_slice(&next().to_le_bytes());
+            for chunk in data.as_chunks_mut::<8>().0 {
+                *chunk = next().to_le_bytes();
             }
             cases.push((state, data));
         }
         for (state, data) in cases {
             let mut expected = state;
-            for block in data.chunks_exact(64) {
-                compress_reference(&mut expected, block.try_into().unwrap());
+            for block in data.as_chunks::<64>().0 {
+                compress_reference(&mut expected, block);
             }
             for backend in backends() {
                 let mut got = state;
@@ -533,8 +534,8 @@ mod tests {
         for _ in 0..4 {
             let mut state = INITIAL;
             let started = std::time::Instant::now();
-            for block in data.chunks_exact(64) {
-                compress_reference(&mut state, block.try_into().unwrap());
+            for block in data.as_chunks::<64>().0 {
+                compress_reference(&mut state, block);
             }
             best_textbook = best_textbook.min(started.elapsed().as_secs_f64());
             for (i, backend) in backends().into_iter().enumerate() {
