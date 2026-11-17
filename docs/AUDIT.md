@@ -630,7 +630,9 @@ pairs, ranges overlapping: no measurable cost). `bench` on `nano` is unchanged (
   `--overwrite`), the build with Rust 1.95, and the dependency audit. The lint job failed: CI
   installs the newest stable Rust (1.100 that day), whose clippy has a lint
   (`chunks_exact_to_as_chunks`) that the 1.97 used here does not, and `integrity.rs` had ten
-  fixed-size `chunks_exact` loops. They use `as_chunks` now. Lint with the toolchain CI uses.
+  fixed-size `chunks_exact` loops. They use `as_chunks` now, and with that commit (`70d295c`)
+  every job of the CI workflow is green. (The dependency audit ran on the first push, which changed
+  `Cargo.lock`; the second left the lockfile alone.) Lint with the toolchain CI uses.
 * **The SHA instructions on any processor but the one used here**, and the portable version on a
   real ARM machine (it is tested on this one by calling it directly).
 * **Windows and macOS under a crash.** The torn-save tests construct the state of a cut-off save by
