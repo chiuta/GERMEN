@@ -237,7 +237,9 @@ script was tried with the real cargo-audit 0.23.0 against five hand-made advisor
 never-compiled crates: pass; a compiled crate with an unmaintained notice: pass, notice printed; a
 compiled crate with an unsound advisory, or with a vulnerability: fail; no advisory at all: pass)
 and against an empty, a malformed and a missing report (exit 2). The real database cannot be reached
-from the sandbox, so the corrected workflow's own run is its first test against it.
+from the sandbox; the corrected workflow ran on GitHub (commit `9fa10b2`, green) and printed 17
+advisories in `Cargo.lock`, 16 of them about three crates that are never compiled (`chrono`, `zip`,
+`zstd-safe`), one notice about a compiled crate (`paste`, unmaintained) and none that applies.
 
 **Added without a finding.** `damaged_weight_files_are_errors_not_crashes` (six kinds of damaged
 `weights.bpk`) and `a_run_with_a_tiny_context_still_ends_with_its_sample` are regression tests that
@@ -376,15 +378,19 @@ element-wise operations around them run on one thread, which is what replicas hi
 
 ## 5. What has not been verified
 
-* Windows and macOS: the `GlobalMemoryStatusEx` call, the `vm_stat` parser on a real Mac, the file
-  lock, and the rename retry under a real antivirus. CI compiles and tests on all three systems
-  and will show failures; it cannot show what an antivirus does.
-* The build with Rust 1.95: the sandbox has 1.97, so the new `msrv` job is the first test of the
-  promise in `Cargo.toml`.
-* `audit.yml` failed on its first run for the reason given under A-20; the corrected version has
-  been tried only with hand-made advisories. The third-party GitHub Actions are pinned by tag, not
-  by commit hash.
-* A bigger machine (§3.3), and a release build on any machine but this one.
+CI settled several things that the sandbox could not. On both pushed commits (`9195e4d`, `9fa10b2`)
+every job of the CI workflow was green: `rustfmt` and `clippy -D warnings`; all 117 tests and an
+end-to-end smoke run (bench, train, resume, BPE, generate, `--replicas 3` and `1`) on Ubuntu 26.04,
+Windows and macOS, which includes the memory-probe test on each system; and a build of the whole
+workspace with Rust 1.95 (the sandbox has 1.97). The dependency audit was red on the first commit
+and is green on the second (A-20). What is left:
+
+* Windows and macOS beyond that smoke run: no training of real size, no speed measurement, no
+  comparison of the `vm_stat` and `GlobalMemoryStatusEx` figures with another source, and the
+  rename retry has never met a real antivirus scanner.
+* The third-party GitHub Actions are pinned by tag, not by commit hash.
+* A bigger machine (§3.3), and a release build on any machine but this one; the release jobs of CI
+  (draft pre-release, binaries) run only for tags and were skipped.
 
 ## 6. Reproducing this audit
 

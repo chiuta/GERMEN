@@ -159,8 +159,11 @@ feed-forward and attention blocks.
 * Cached generation produces the same greedy text as the full forward pass, and the same text as
   before the cache for the first window.
 * Benchmarks on a 2-core AVX-512 virtual machine (table in the README).
-* **Not verified:** native Windows and macOS runs (the CI workflow builds and smoke-tests both; the
-  Windows memory probe, the macOS `vm_stat` parser on a real Mac, the directory lock and the
-  rename retry have only been run on Linux or by unit test); the build with Rust 1.95 (the new CI
-  job is the first test of it); the weekly dependency audit; anything on more than two cores; anything beyond the 85 M `base`
-  preset; any real-world corpus; loading a GERMEN model in another engine.
+* CI on the pushed commits `9195e4d` and `9fa10b2` (every job green): `rustfmt`, `clippy -D
+  warnings`, the 117 tests and an end-to-end smoke run on Ubuntu 26.04, Windows and macOS, and a
+  build with Rust 1.95. The weekly dependency audit is green since `9fa10b2` (red on the first
+  commit; see A-20 in [AUDIT.md](AUDIT.md)).
+* **Not verified:** Windows and macOS beyond the CI smoke run (no real-size training or speed
+  figures there, and the rename retry has never met a real antivirus scanner); anything on more
+  than two cores; anything beyond the 85 M `base` preset; any real-world corpus; loading a GERMEN
+  model in another engine.
