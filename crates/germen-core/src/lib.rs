@@ -2,24 +2,29 @@
 //!
 //! Train a small language model **from scratch**, in pure Rust, on an ordinary CPU.
 //!
-//! The network is a GPT-style decoder (RMSNorm, rotary positions, squared-ReLU MLP) over a byte-level
-//! vocabulary, written on [Burn](https://burn.dev) with its pure-Rust `flex` backend: no Python,
-//! no CUDA, no C/C++ toolchain, nothing to install besides the binary itself.
+//! The network is a GPT-style decoder (RMSNorm, rotary positions, squared-ReLU MLP) over bytes or a
+//! trained byte-level BPE vocabulary, written on [Burn](https://burn.dev) with its pure-Rust `flex`
+//! backend: no Python, no CUDA, no C/C++ toolchain, nothing to install besides the binary itself.
 //!
 //! * [`config`] — architecture and size presets
-//! * [`model`] — the network
+//! * [`model`] — the network, with a key/value cache for generation
+//! * [`tokenizer`] and [`bpe`] — bytes or a trainable BPE vocabulary
 //! * [`data`] — corpus, batches, built-in demo text
-//! * [`train`] — the training loop
+//! * [`train`] — the training loop (AdamW, accumulation, resume)
+//! * [`gradients`] — global-norm clipping
 //! * [`generate`] — sampling text from a trained model
 //! * [`checkpoint`] — saving and loading
-//! * [`bench`] — measuring training speed on the current machine
+//! * [`mod@bench`] — measuring training speed (and its scaling with threads) on this machine
+//! * [`sys`] — machine description and the worker pool a command should run in
 #![warn(missing_docs)]
 
 pub mod bench;
+pub mod bpe;
 pub mod checkpoint;
 pub mod config;
 pub mod data;
 pub mod generate;
+pub mod gradients;
 pub mod model;
 pub mod sys;
 pub mod tokenizer;

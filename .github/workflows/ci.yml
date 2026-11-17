@@ -47,16 +47,24 @@ jobs:
         run: cargo test --release --workspace
       - name: Build the command-line tool
         run: cargo build --release -p germen-cli
-      - name: Smoke test, end to end (corpus, train, generate)
+      - name: Smoke test, end to end (bench, train, resume, BPE, generate)
         shell: bash
         run: |
           BIN=target/release/germen
           "$BIN" info
           "$BIN" bench --preset nano --batch 4 --seq 64 --steps 2 --warmup 1
+          "$BIN" bench --scaling 1,2 --preset nano --batch 4 --seq 64 --steps 1 --warmup 0
           "$BIN" train --demo --demo-mb 0.2 --preset nano --seq 64 --batch 8 \
                  --steps 40 --eval-every 20 --eval-batches 2 --log-every 10 \
                  --out ci-model
+          "$BIN" train --demo --demo-mb 0.2 --seq 64 --batch 4 --accum 2 \
+                 --steps 60 --eval-every 20 --eval-batches 2 --log-every 10 \
+                 --out ci-model --resume
           "$BIN" generate --model ci-model --max-new 40 --seed 1
+          "$BIN" train --demo --demo-mb 0.2 --preset nano --tokenizer bpe --vocab 400 \
+                 --seq 64 --batch 8 --steps 30 --eval-every 15 --eval-batches 2 \
+                 --log-every 10 --out ci-bpe
+          "$BIN" generate --model ci-bpe --max-new 40 --seed 1
 
   release:
     name: draft pre-release
@@ -109,7 +117,7 @@ jobs:
         shell: bash
         run: |
           mkdir -p "${{ matrix.name }}"
-          cp "target/dist/${{ matrix.exe }}" README.md README.ro.md LICENSE CHANGELOG.md "${{ matrix.name }}/"
+          cp "target/dist/${{ matrix.exe }}" README*.md LICENSE CHANGELOG.md "${{ matrix.name }}/"
           PY=$(command -v python3 || command -v python)
           "$PY" -m zipfile -c "${{ matrix.name }}.zip" "${{ matrix.name }}"
       - name: Attach to the release

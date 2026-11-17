@@ -4,3 +4,4 @@
 *.bpk
 /demo.txt
 /bench*.json
+/ci-bpe/

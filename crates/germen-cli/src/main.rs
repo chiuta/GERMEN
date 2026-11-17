@@ -3,13 +3,16 @@
 //! Subcommands: `info`, `bench`, `demo-corpus`, `train`, `generate`.
 
 use clap::{Args, Parser, Subcommand};
-use germen_core::bench::{BenchReport, bench_model};
+use germen_core::bench::{
+    BenchParams, BenchReport, bench_model, bench_scaling, default_thread_counts,
+};
+use germen_core::bpe::Bpe;
 use germen_core::checkpoint;
 use germen_core::config::{GptConfig, Preset};
-use germen_core::data::{Corpus, Rng, demo_corpus};
+use germen_core::data::{Corpus, Rng, demo_corpus, split_point};
 use germen_core::generate::{SampleOptions, generate};
 use germen_core::sys;
-use germen_core::tokenizer::{ByteTokenizer, Utf8Stream};
+use germen_core::tokenizer::{Tokenizer, Utf8Stream};
 use germen_core::train::{Event, TrainOptions, train};
 use std::io::Write;
 use std::path::PathBuf;
@@ -49,21 +52,35 @@ enum Command {
 
 #[derive(Args)]
 struct BenchArgs {
-    /// Dimensiunea modelului: nano, micro, mini, small, base sau all (= primele patru)
-    #[arg(long, default_value = "all")]
-    preset: String,
+    /// Dimensiunea modelului: nano, micro, mini, small, base sau all (= primele patru).
+    /// Implicit: all; cu --scaling, mini
+    #[arg(long)]
+    preset: Option<String>,
     /// Ferestre de text pe pas
     #[arg(long, default_value_t = 16)]
     batch: usize,
-    /// Lungimea contextului în tokeni (octeți)
+    /// Lungimea contextului în tokeni
     #[arg(long, default_value_t = 256)]
     seq: usize,
+    /// Mărimea vocabularului (256 = octeți; un vocabular BPE mai mare face capul modelului mai scump)
+    #[arg(long, default_value_t = 256)]
+    vocab: usize,
     /// Pași cronometrați pentru fiecare model
     #[arg(long, default_value_t = 4)]
     steps: usize,
     /// Pași de încălzire, necronometrați
     #[arg(long, default_value_t = 2)]
     warmup: usize,
+    /// Măsoară și cum crește viteza cu numărul de fire: fără valoare, 1, 2, 4, 8… până la
+    /// toate procesoarele logice; sau o listă, de pildă `--scaling 1,2,4,8,16,20`
+    #[arg(
+        long,
+        value_name = "LISTĂ",
+        num_args = 0..=1,
+        default_missing_value = "auto",
+        value_delimiter = ','
+    )]
+    scaling: Option<Vec<String>>,
     /// Salvează rezultatele și în acest fișier JSON (util pentru a le trimite mai departe)
     #[arg(long, value_name = "FIȘIER")]
     json: Option<PathBuf>,
@@ -99,12 +116,26 @@ struct TrainArgs {
     /// Dimensiunea modelului: nano, micro, mini, small, base
     #[arg(long, default_value = "mini")]
     preset: String,
+    /// Tokenizatorul: `byte` (un token = un octet; nu cere antrenare) sau `bpe` (vocabular învățat
+    /// din text: de 3–4 ori mai mult text în același context). La --resume se folosește cel salvat
+    #[arg(long, default_value = "byte", value_parser = ["byte", "bpe"])]
+    tokenizer: String,
+    /// Mărimea vocabularului BPE (257–65536); contează doar cu --tokenizer bpe
+    #[arg(long, default_value_t = 2048)]
+    vocab: usize,
+    /// Cât din text se folosește pentru a învăța vocabularul BPE, în MiB (bucăți egal depărtate)
+    #[arg(long, default_value_t = 64.0)]
+    bpe_sample_mb: f64,
     /// Lungimea contextului (octeți). Implicit: 256, iar la --resume cea a modelului salvat
     #[arg(long)]
     seq: Option<usize>,
-    /// Ferestre de text pe pas
+    /// Ferestre de text într-un micro-lot (cât se ține în memorie deodată)
     #[arg(long, default_value_t = 16)]
     batch: usize,
+    /// Micro-loturi însumate înainte de fiecare pas: lotul efectiv = --batch × --accum, cu
+    /// memoria lui --batch
+    #[arg(long, default_value_t = 1)]
+    accum: usize,
     /// Numărul total de pași de antrenare
     #[arg(long, default_value_t = 2000)]
     steps: usize,
@@ -120,7 +151,7 @@ struct TrainArgs {
     /// Descompunerea ponderilor (AdamW)
     #[arg(long, default_value_t = 0.01)]
     weight_decay: f32,
-    /// Limita normei gradientului pe fiecare tensor (0 = oprit)
+    /// Limita normei globale a gradientului (0 = oprit)
     #[arg(long, default_value_t = 1.0)]
     grad_clip: f32,
     /// Validează la fiecare atâția pași (0 = oprit)
@@ -157,7 +188,7 @@ struct GenerateArgs {
     /// Începutul textului (gol = pornește de la un rând nou)
     #[arg(long, default_value = "")]
     prompt: String,
-    /// Câți octeți noi să genereze
+    /// Câți tokeni noi să genereze
     #[arg(long, default_value_t = 300)]
     max_new: usize,
     /// Temperatura: 0 = alegerea cea mai probabilă, mai mare = mai variat
@@ -166,7 +197,7 @@ struct GenerateArgs {
     /// Se aleg doar primele k variante (0 = oprit)
     #[arg(long, default_value_t = 40)]
     top_k: usize,
-    /// Câți octeți recenți vede modelul la fiecare pas
+    /// Contextul maxim citit de model, în tokeni; când se umple, generarea continuă din jumătatea cea mai recentă
     #[arg(long, default_value_t = 128)]
     window: usize,
     /// Sămânța (implicit: aleatoare)
@@ -176,22 +207,27 @@ struct GenerateArgs {
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
-    if let Some(n) = cli.threads {
-        if n == 0 {
-            eprintln!("eroare: --threads trebuie să fie cel puțin 1");
-            return ExitCode::from(2);
-        }
-        if !sys::set_worker_threads(n) {
-            eprintln!("avertisment: nu am putut fixa numărul de fire");
-        }
+    if cli.threads == Some(0) {
+        eprintln!("eroare: --threads trebuie să fie cel puțin 1");
+        return ExitCode::from(2);
     }
-    let result = match cli.command {
+    let threads_flag_given = cli.threads.is_some();
+    // A thread sweep builds its own pools, so the one it starts from needs a single worker.
+    let threads = match &cli.command {
+        Command::Bench(a) if a.scaling.is_some() => Some(1),
+        _ => cli.threads,
+    };
+    let command = cli.command;
+    // The whole command runs as a worker of its own pool: parallel loops start faster that way
+    // than from a thread outside the pool (see `sys::run_in_pool`).
+    let result = sys::run_in_pool(threads, move || match command {
         Command::Info => cmd_info(),
-        Command::Bench(a) => cmd_bench(a),
+        Command::Bench(a) => cmd_bench(a, threads_flag_given),
         Command::DemoCorpus(a) => cmd_demo(a),
         Command::Train(a) => cmd_train(a),
         Command::Generate(a) => cmd_generate(a),
-    };
+    })
+    .and_then(|r| r);
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
@@ -251,11 +287,34 @@ fn cmd_info() -> Result<(), String> {
     Ok(())
 }
 
-fn cmd_bench(a: BenchArgs) -> Result<(), String> {
-    let presets: Vec<Preset> = if a.preset.eq_ignore_ascii_case("all") {
+/// Thread counts requested with `--scaling`: `auto` (alone) or a list of numbers.
+fn parse_thread_list(list: &[String]) -> Result<Vec<usize>, String> {
+    if list.len() == 1 && list[0].eq_ignore_ascii_case("auto") {
+        return Ok(default_thread_counts(sys::logical_cpus()));
+    }
+    list.iter()
+        .map(|item| {
+            item.trim()
+                .parse::<usize>()
+                .ok()
+                .filter(|&n| n >= 1)
+                .ok_or_else(|| {
+                    format!("--scaling: „{item}” nu e un număr de fire valid (întreg, cel puțin 1)")
+                })
+        })
+        .collect()
+}
+
+fn cmd_bench(a: BenchArgs, threads_flag_given: bool) -> Result<(), String> {
+    let scaling = a.scaling.is_some();
+    let which = a
+        .preset
+        .as_deref()
+        .unwrap_or(if scaling { "mini" } else { "all" });
+    let presets: Vec<Preset> = if which.eq_ignore_ascii_case("all") {
         Preset::DEFAULT_BENCH.to_vec()
     } else {
-        vec![parse_preset(&a.preset)?]
+        vec![parse_preset(which)?]
     };
     if !sys::is_optimised_build() {
         eprintln!(
@@ -267,22 +326,60 @@ fn cmd_bench(a: BenchArgs) -> Result<(), String> {
         "Benchmark: lot {}×{} octeți, {} pași cronometrați (+{} de încălzire) pe model",
         a.batch, a.seq, a.steps, a.warmup
     );
-    for p in presets {
-        eprint!("  {:<6} ... ", p.name());
-        let _ = std::io::stderr().flush();
-        let r = bench_model(
-            p.name(),
-            &p.config(a.seq),
-            a.batch,
-            a.seq,
-            a.warmup,
-            a.steps,
-        )?;
-        eprintln!(
-            "{:.0} ms/pas · {:.0} tokeni/s",
-            r.ms_per_step, r.tokens_per_sec
-        );
-        report.results.push(r);
+
+    if let Some(list) = &a.scaling {
+        let counts = parse_thread_list(list)?;
+        if threads_flag_given {
+            eprintln!(
+                "avertisment: --threads e ignorat cu --scaling (fiecare măsurătoare își alege singură numărul de fire)"
+            );
+        }
+        let cpus = sys::logical_cpus();
+        if let Some(too_many) = counts.iter().find(|&&n| n > cpus) {
+            eprintln!(
+                "avertisment: {too_many} fire depășesc cele {cpus} procesoare logice; peste acest număr viteza nu mai crește"
+            );
+        }
+        let params = BenchParams {
+            batch: a.batch,
+            seq: a.seq,
+            warmup: a.warmup,
+            steps: a.steps,
+        };
+        for p in presets {
+            eprintln!("  {}:", p.name());
+            let series = bench_scaling(
+                p.name(),
+                &p.config(a.seq).with_vocab(a.vocab),
+                &params,
+                &counts,
+                |pt| {
+                    eprintln!(
+                        "    {:>3} fire: {:.0} ms/pas · {:.0} tokeni/s",
+                        pt.threads, pt.result.ms_per_step, pt.result.tokens_per_sec
+                    );
+                },
+            )?;
+            report.scaling.push(series);
+        }
+    } else {
+        for p in presets {
+            eprint!("  {:<6} ... ", p.name());
+            let _ = std::io::stderr().flush();
+            let r = bench_model(
+                p.name(),
+                &p.config(a.seq).with_vocab(a.vocab),
+                a.batch,
+                a.seq,
+                a.warmup,
+                a.steps,
+            )?;
+            eprintln!(
+                "{:.0} ms/pas · {:.0} tokeni/s",
+                r.ms_per_step, r.tokens_per_sec
+            );
+            report.results.push(r);
+        }
     }
     println!();
     println!("{}", report.render());
@@ -311,26 +408,95 @@ fn cmd_demo(a: DemoArgs) -> Result<(), String> {
     Ok(())
 }
 
+/// Up to `budget` bytes of `data`, taken as evenly spaced 1 MiB blocks so that a very large
+/// corpus is represented by all of its parts, not only by its beginning.
+fn sample_blocks(data: &[u8], budget: usize) -> Vec<u8> {
+    const BLOCK: usize = 1 << 20;
+    if data.len() <= budget {
+        return data.to_vec();
+    }
+    let blocks = (budget / BLOCK).max(1);
+    let stride = data.len() / blocks;
+    let mut out = Vec::with_capacity(blocks * BLOCK);
+    for i in 0..blocks {
+        let start = i * stride;
+        out.extend_from_slice(&data[start..(start + BLOCK).min(data.len())]);
+    }
+    out
+}
+
 fn cmd_train(a: TrainArgs) -> Result<(), String> {
-    // Corpus.
-    let corpus = match (&a.data, a.demo) {
-        (Some(path), false) => Corpus::from_file(path, a.val_fraction)?,
-        (None, true) => {
-            let text = demo_corpus((a.demo_mb * 1024.0 * 1024.0) as usize, a.seed);
-            Corpus::from_bytes(text.into_bytes(), a.val_fraction)?
+    // Text.
+    let text: Vec<u8> = match (&a.data, a.demo) {
+        (Some(path), false) => {
+            std::fs::read(path).map_err(|e| format!("nu pot citi {}: {e}", path.display()))?
         }
+        (None, true) => demo_corpus((a.demo_mb * 1024.0 * 1024.0) as usize, a.seed).into_bytes(),
         _ => return Err("alegeți datele: --data FIȘIER sau --demo".into()),
     };
 
-    // Architecture: from the checkpoint when resuming, otherwise from the preset.
+    // Tokenizer: the saved one when resuming, otherwise as requested (BPE is learned from the
+    // training part of the text only).
+    let tokenizer = if a.resume {
+        let t = Tokenizer::load(&a.out)?;
+        if t.name() != a.tokenizer && a.tokenizer != "byte" {
+            eprintln!(
+                "avertisment: la --resume se folosește tokenizatorul salvat ({}), nu --tokenizer {}",
+                t.name(),
+                a.tokenizer
+            );
+        }
+        t
+    } else if a.tokenizer == "bpe" {
+        if !(a.bpe_sample_mb > 0.0 && a.bpe_sample_mb <= 4096.0) {
+            return Err("--bpe-sample-mb trebuie să fie între 0 și 4096".into());
+        }
+        let train_part = &text[..split_point(text.len(), a.val_fraction)];
+        let sample = sample_blocks(train_part, (a.bpe_sample_mb * 1048576.0) as usize);
+        eprintln!(
+            "Învăț vocabularul BPE ({} tokeni) din {:.1} MiB de text...",
+            a.vocab,
+            sample.len() as f64 / 1048576.0
+        );
+        let started = std::time::Instant::now();
+        let bpe = Bpe::train(&sample, a.vocab, &mut |done, wanted| {
+            eprint!("\r  îmbinări: {done}/{wanted}   ");
+            let _ = std::io::stderr().flush();
+        })?;
+        eprintln!(
+            "\r  gata în {}: {} de tokeni.            ",
+            sys::human_duration(started.elapsed().as_secs_f64()),
+            bpe.vocab_size()
+        );
+        Tokenizer::Bpe(bpe)
+    } else {
+        Tokenizer::Byte
+    };
+
+    let started = std::time::Instant::now();
+    let corpus = Corpus::build(&text, a.val_fraction, tokenizer)?;
+    drop(text);
+    eprintln!(
+        "Corpus: {:.2} MiB → {} de tokeni ({:.2} octeți/token), pregătit în {}.",
+        corpus.bytes as f64 / 1048576.0,
+        corpus.len(),
+        corpus.bytes_per_token(),
+        sys::human_duration(started.elapsed().as_secs_f64())
+    );
+
+    // Architecture: from the checkpoint when resuming, otherwise from the preset (its vocabulary
+    // is the tokenizer's).
     let cfg: GptConfig = if a.resume {
         checkpoint::load_config(&a.out)?
     } else {
-        parse_preset(&a.preset)?.config(a.seq.unwrap_or(256))
+        parse_preset(&a.preset)?
+            .config(a.seq.unwrap_or(256))
+            .with_vocab(corpus.tokenizer.vocab_size())
     };
     let opts = TrainOptions {
         steps: a.steps,
         batch: a.batch,
+        accum: a.accum,
         seq: a.seq.unwrap_or(cfg.block_size),
         lr: a.lr,
         min_lr_ratio: a.min_lr_ratio,
@@ -359,6 +525,7 @@ fn cmd_train(a: TrainArgs) -> Result<(), String> {
     }
 
     let ln2 = std::f32::consts::LN_2;
+    let mut bytes_per_token = 1.0f64;
     let report = train(
         &corpus,
         &cfg,
@@ -373,33 +540,60 @@ fn cmd_train(a: TrainArgs) -> Result<(), String> {
                 est_memory_bytes,
                 from_step,
                 total_steps,
-                train_bytes,
+                train_tokens,
+                bytes_per_token: bpt,
+                vocab_size,
+                optimizer_restored,
             } => {
+                bytes_per_token = bpt;
                 println!(
-                    "GERMEN {} · {:.2}M parametri · {} tokeni/pas · pașii {}→{} · {:.2} MiB de antrenare · memorie estimată ≤ {:.1} GiB",
+                    "GERMEN {} · {:.2}M parametri · vocabular {} · {} tokeni/pas · pașii {}→{} · {} tokeni de antrenare · memorie estimată ≤ {:.1} GiB",
                     germen_core::VERSION,
                     params as f64 / 1e6,
+                    vocab_size,
                     tokens_per_step,
                     from_step,
                     total_steps,
-                    train_bytes as f64 / 1048576.0,
+                    train_tokens,
                     est_memory_bytes as f64 / 1073741824.0
                 );
-                println!(
-                    "Pierdere la început, pentru un model neantrenat: ~5.545 nats/octet. Ctrl-C salvează și oprește."
-                );
+                if from_step > 0 {
+                    println!(
+                        "{}",
+                        if optimizer_restored {
+                            "Reluare: ponderile și starea AdamW au fost restaurate."
+                        } else {
+                            "Reluare: ponderile au fost restaurate, dar punctul de control nu are \
+                             starea AdamW (e dinainte de 0.2); momentele pornesc de la zero."
+                        }
+                    );
+                }
+                if from_step == 0 {
+                    println!(
+                        "Pierdere la început, pentru un model neantrenat: ~{:.3} nats/token (= ln {vocab_size}). Ctrl-C salvează și oprește.",
+                        (vocab_size as f64).ln()
+                    );
+                } else {
+                    println!("Ctrl-C salvează și oprește.");
+                }
             }
             Event::Step {
                 step,
                 total,
                 loss,
                 lr,
+                grad_norm,
                 tokens_per_sec,
                 elapsed,
                 eta,
             } => {
+                let gn = if grad_norm.is_finite() {
+                    format!(" · ‖g‖ {grad_norm:.2}")
+                } else {
+                    String::new()
+                };
                 println!(
-                    "pas {step:>6}/{total} · pierdere {loss:.4} · lr {lr:.2e} · {tokens_per_sec:>7.0} tok/s · scurs {} · rămas ~{}",
+                    "pas {step:>6}/{total} · pierdere {loss:.4} · lr {lr:.2e}{gn} · {tokens_per_sec:>7.0} tok/s · scurs {} · rămas ~{}",
                     sys::human_duration(elapsed),
                     sys::human_duration(eta)
                 );
@@ -410,8 +604,8 @@ fn cmd_train(a: TrainArgs) -> Result<(), String> {
                 best,
             } => {
                 println!(
-                    "  >> validare la pasul {step}: {val_loss:.4} nats/octet ({:.3} biți/octet){}",
-                    val_loss / ln2,
+                    "  >> validare la pasul {step}: {val_loss:.4} nats/token ({:.3} biți/octet){}",
+                    val_loss / ln2 / bytes_per_token as f32,
                     if best {
                         "  ← cel mai bun până acum"
                     } else {
@@ -450,8 +644,8 @@ fn cmd_train(a: TrainArgs) -> Result<(), String> {
     }
     if let Some(v) = report.last_val_loss {
         println!(
-            "Validare finală: {v:.4} nats/octet ({:.3} biți/octet).",
-            v / ln2
+            "Validare finală: {v:.4} nats/token ({:.3} biți/octet).",
+            v / ln2 / bytes_per_token as f32
         );
     }
     println!(
@@ -465,9 +659,19 @@ fn cmd_train(a: TrainArgs) -> Result<(), String> {
 fn cmd_generate(a: GenerateArgs) -> Result<(), String> {
     let device = germen_core::cpu_device();
     let (model, cfg, meta) = checkpoint::load(&a.model, &device)?;
+    let tokenizer = Tokenizer::load(&a.model)?;
+    if tokenizer.vocab_size() != cfg.vocab_size {
+        return Err(format!(
+            "tokenizatorul ({} tokeni) nu se potrivește cu modelul (vocabular {})",
+            tokenizer.vocab_size(),
+            cfg.vocab_size
+        ));
+    }
     eprintln!(
-        "Model: {:.2}M parametri, context {}, antrenat {} pași.",
+        "Model: {:.2}M parametri, tokenizator {} ({} tokeni), context {}, antrenat {} pași.",
         cfg.num_params() as f64 / 1e6,
+        tokenizer.name(),
+        tokenizer.vocab_size(),
         cfg.block_size,
         meta.step
     );
@@ -483,21 +687,26 @@ fn cmd_generate(a: GenerateArgs) -> Result<(), String> {
         top_k: a.top_k,
         window: a.window,
     };
-    let tok = ByteTokenizer;
-    let prompt = tok.encode(&a.prompt);
-
     let mut out = std::io::stdout().lock();
     let _ = write!(out, "{}", a.prompt);
     let _ = out.flush();
     let mut stream = Utf8Stream::new();
     let mut rng = Rng::new(seed);
-    generate(&model, &prompt, &opts, &mut rng, &device, |byte| {
-        let piece = stream.push(byte);
-        if !piece.is_empty() {
-            let _ = write!(out, "{piece}");
-            let _ = out.flush();
-        }
-    });
+    generate(
+        &model,
+        &tokenizer,
+        a.prompt.as_bytes(),
+        &opts,
+        &mut rng,
+        &device,
+        |token| {
+            let piece = stream.push_token(&tokenizer, token);
+            if !piece.is_empty() {
+                let _ = write!(out, "{piece}");
+                let _ = out.flush();
+            }
+        },
+    );
     // A character cut off by --max-new is dropped rather than shown as a replacement mark.
     let _ = writeln!(out);
     Ok(())

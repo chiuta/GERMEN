@@ -6,7 +6,7 @@ use burn::nn::{
     Embedding, EmbeddingConfig, Initializer, Linear, LinearConfig, RmsNorm, RmsNormConfig,
 };
 use burn::prelude::*;
-use burn::tensor::activation::relu;
+use burn::tensor::activation::{relu, softmax};
 use burn::tensor::module::attention;
 use burn::tensor::ops::AttentionModuleOptions;
 
@@ -32,6 +32,105 @@ fn apply_rope(x: Tensor<4>, cos: &Tensor<4>, sin: &Tensor<4>) -> Tensor<4> {
     Tensor::cat(vec![o1, o2], 3)
 }
 
+/// Value added to the scores of positions a query must not see. Finite on purpose: `-inf` would
+/// make `-inf - max` and `0 * -inf` appear in the backward pass.
+const MASKED: f32 = -1.0e30;
+
+/// Row-major `[n, n]` additive causal mask: 0 on and below the diagonal, [`MASKED`] above it.
+fn causal_mask_values(n: usize) -> Vec<f32> {
+    let mut mask = vec![0.0f32; n * n];
+    for row in 0..n {
+        mask[row * n + row + 1..(row + 1) * n].fill(MASKED);
+    }
+    mask
+}
+
+/// Queries are processed in blocks of this many positions during training (see
+/// [`causal_attention_blocks`]): twice the head dimension. More blocks skip more of the masked
+/// upper triangle but cost more small operations; on two threads at 256 tokens this was the best
+/// of 32, 64, 128 and 256 for head dimensions 32 (`nano`, `micro`) and 64 (`mini`).
+fn attention_block(head_dim: usize) -> usize {
+    (2 * head_dim).clamp(32, 256)
+}
+
+/// Causal attention for training, `softmax(q kᵀ / √d + mask) v`, written with ordinary
+/// differentiable tensor operations.
+///
+/// Compared with Burn's `attention`, which under autodiff expands into a long chain of
+/// operations over the full `[seq, seq]` score matrix, this version
+/// - never computes the masked upper-right blocks: queries are processed in blocks and a block
+///   only looks at the keys up to its own end (about 25–30 % faster on `mini`, see
+///   `examples/profile_attn.rs`);
+/// - folds the `1/√d` scale into the queries instead of scaling every score.
+///
+/// The result equals Burn's attention up to floating-point rounding (tested).
+/// `mask` is `[1, 1, seq, seq]` with `0` where attention is allowed and [`MASKED`] elsewhere.
+fn causal_attention_blocks(
+    q: Tensor<4>,
+    k: Tensor<4>,
+    v: Tensor<4>,
+    mask: &Tensor<4>,
+    block: usize,
+) -> Tensor<4> {
+    let [b, h, t, hd] = q.dims();
+    let q = q.mul_scalar(1.0 / (hd as f32).sqrt());
+    if t <= block {
+        let scores = q.matmul(k.swap_dims(2, 3)) + mask.clone();
+        return softmax(scores, 3).matmul(v);
+    }
+    let mut outs = Vec::with_capacity(t.div_ceil(block));
+    let mut lo = 0;
+    while lo < t {
+        let hi = (lo + block).min(t);
+        let qi = q.clone().slice([0..b, 0..h, lo..hi, 0..hd]);
+        let ki = k.clone().slice([0..b, 0..h, 0..hi, 0..hd]);
+        let vi = v.clone().slice([0..b, 0..h, 0..hi, 0..hd]);
+        let mi = mask.clone().slice([0..1, 0..1, lo..hi, 0..hi]);
+        let scores = qi.matmul(ki.swap_dims(2, 3)) + mi;
+        outs.push(softmax(scores, 3).matmul(vi));
+        lo = hi;
+    }
+    Tensor::cat(outs, 2)
+}
+
+/// Part `which` (0 = queries, 1 = keys, 2 = values) of a fused `[b, t, 3d]` projection, as
+/// `[b, heads, t, head_dim]`.
+fn split_heads(qkv: &Tensor<3>, which: usize, heads: usize) -> Tensor<4> {
+    let [b, t, d3] = qkv.dims();
+    let d = d3 / 3;
+    qkv.clone()
+        .slice([0..b, 0..t, which * d..(which + 1) * d])
+        .reshape([b, t, heads, d / heads])
+        .swap_dims(1, 2)
+}
+
+/// Keys and values of the tokens the model has already read — one `[batch, heads, len, head_dim]`
+/// pair per layer — so that generating the next token costs one token's worth of computation
+/// instead of re-reading the whole context. Create one with [`Gpt::new_cache`].
+#[derive(Debug)]
+pub struct KvCache {
+    layers: Vec<Option<(Tensor<4>, Tensor<4>)>>,
+    len: usize,
+}
+
+impl KvCache {
+    /// Number of tokens read so far.
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Whether nothing has been read yet.
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Forgets everything.
+    pub fn clear(&mut self) {
+        self.len = 0;
+        self.layers.iter_mut().for_each(|l| *l = None);
+    }
+}
+
 /// Causal multi-head self-attention.
 #[derive(Module, Debug)]
 pub struct CausalSelfAttention {
@@ -53,30 +152,66 @@ impl CausalSelfAttention {
         }
     }
 
-    fn forward(&self, x: Tensor<3>, cos: &Tensor<4>, sin: &Tensor<4>) -> Tensor<3> {
+    fn forward(
+        &self,
+        x: Tensor<3>,
+        cos: &Tensor<4>,
+        sin: &Tensor<4>,
+        mask: &Tensor<4>,
+    ) -> Tensor<3> {
+        let [b, t, d] = x.dims();
+        let h = self.n_head;
+
+        let qkv = self.qkv.forward(x); // [b, t, 3d]
+        let q = apply_rope(split_heads(&qkv, 0, h), cos, sin);
+        let k = apply_rope(split_heads(&qkv, 1, h), cos, sin);
+        let v = split_heads(&qkv, 2, h);
+
+        let y = if q.is_autodiff() {
+            causal_attention_blocks(q, k, v, mask, attention_block(d / h)) // training
+        } else {
+            // Evaluation and generation: Burn's fused, multi-threaded kernel.
+            let options = AttentionModuleOptions {
+                scale: None,
+                softcap: None,
+                is_causal: true,
+            };
+            attention(q, k, v, None, None, options)
+        }; // [b, h, t, hd]
+        let y = y.swap_dims(1, 2).reshape([b, t, d]);
+        self.proj.forward(y)
+    }
+
+    /// Attention for `t` new tokens that come after what `cache` already holds. `cos`/`sin` are
+    /// the rotary tables for the new positions; `mask` is `[1, 1, t, total]`.
+    fn forward_cached(
+        &self,
+        x: Tensor<3>,
+        cos: &Tensor<4>,
+        sin: &Tensor<4>,
+        mask: &Tensor<4>,
+        cache: &mut Option<(Tensor<4>, Tensor<4>)>,
+    ) -> Tensor<3> {
         let [b, t, d] = x.dims();
         let h = self.n_head;
         let hd = d / h;
 
-        let qkv = self.qkv.forward(x); // [b, t, 3d]
-        let split = |lo: usize| {
-            qkv.clone()
-                .slice([0..b, 0..t, lo..lo + d])
-                .reshape([b, t, h, hd])
-                .swap_dims(1, 2) // [b, h, t, hd]
+        let qkv = self.qkv.forward(x);
+        let q = apply_rope(split_heads(&qkv, 0, h), cos, sin);
+        let k = apply_rope(split_heads(&qkv, 1, h), cos, sin);
+        let v = split_heads(&qkv, 2, h);
+        let (k, v) = match cache.take() {
+            Some((pk, pv)) => (Tensor::cat(vec![pk, k], 2), Tensor::cat(vec![pv, v], 2)),
+            None => (k, v),
         };
-        let q = apply_rope(split(0), cos, sin);
-        let k = apply_rope(split(d), cos, sin);
-        let v = split(2 * d);
+        *cache = Some((k.clone(), v.clone()));
 
-        let options = AttentionModuleOptions {
-            scale: None,
-            softcap: None,
-            is_causal: true,
-        };
-        let y = attention(q, k, v, None, None, options); // [b, h, t, hd]
-        let y = y.swap_dims(1, 2).reshape([b, t, d]);
-        self.proj.forward(y)
+        let scores = q
+            .mul_scalar(1.0 / (hd as f32).sqrt())
+            .matmul(k.swap_dims(2, 3))
+            + mask.clone();
+        let y = softmax(scores, 3).matmul(v); // [b, h, t, hd]
+        self.proj.forward(y.swap_dims(1, 2).reshape([b, t, d]))
     }
 }
 
@@ -131,8 +266,29 @@ impl Block {
         }
     }
 
-    fn forward(&self, x: Tensor<3>, cos: &Tensor<4>, sin: &Tensor<4>) -> Tensor<3> {
-        let x = x.clone() + self.attn.forward(self.norm1.forward(x), cos, sin);
+    fn forward(
+        &self,
+        x: Tensor<3>,
+        cos: &Tensor<4>,
+        sin: &Tensor<4>,
+        mask: &Tensor<4>,
+    ) -> Tensor<3> {
+        let x = x.clone() + self.attn.forward(self.norm1.forward(x), cos, sin, mask);
+        x.clone() + self.mlp.forward(self.norm2.forward(x))
+    }
+
+    fn forward_cached(
+        &self,
+        x: Tensor<3>,
+        cos: &Tensor<4>,
+        sin: &Tensor<4>,
+        mask: &Tensor<4>,
+        cache: &mut Option<(Tensor<4>, Tensor<4>)>,
+    ) -> Tensor<3> {
+        let a = self
+            .attn
+            .forward_cached(self.norm1.forward(x.clone()), cos, sin, mask, cache);
+        let x = x + a;
         x.clone() + self.mlp.forward(self.norm2.forward(x))
     }
 }
@@ -147,6 +303,9 @@ pub struct Gpt {
     /// Rotary tables, `[block_size, head_dim / 2]`. Constants, not trained.
     rope_cos: Tensor<2>,
     rope_sin: Tensor<2>,
+    /// Additive causal mask, `[block_size, block_size]`: 0 on and below the diagonal, [`MASKED`]
+    /// above it. Constant, not trained.
+    causal_mask: Tensor<2>,
     block_size: usize,
 }
 
@@ -173,6 +332,9 @@ impl GptConfig {
         let table = |v: Vec<f32>| {
             Tensor::<2>::from_data(TensorData::new(v, [self.block_size, half]), device)
         };
+        let n = self.block_size;
+        let causal_mask =
+            Tensor::<2>::from_data(TensorData::new(causal_mask_values(n), [n, n]), device);
 
         Gpt {
             wte: EmbeddingConfig::new(self.vocab_size, self.d_model)
@@ -190,6 +352,7 @@ impl GptConfig {
             head: linear(self.d_model, self.vocab_size, INIT_STD, device),
             rope_cos: table(cos),
             rope_sin: table(sin),
+            causal_mask,
             block_size: self.block_size,
         }
     }
@@ -214,11 +377,61 @@ impl Gpt {
         let half = self.rope_cos.dims()[1];
         let table = |tab: &Tensor<2>| tab.clone().slice([0..t, 0..half]).reshape([1, 1, t, half]);
         let (cos, sin) = (table(&self.rope_cos), table(&self.rope_sin));
+        let mask = self
+            .causal_mask
+            .clone()
+            .slice([0..t, 0..t])
+            .reshape([1, 1, t, t]);
 
         let mut x = self.wte.forward(tokens);
         for block in &self.blocks {
-            x = block.forward(x, &cos, &sin);
+            x = block.forward(x, &cos, &sin, &mask);
         }
+        self.head.forward(self.norm_f.forward(x))
+    }
+
+    /// An empty cache for [`Gpt::forward_cached`].
+    pub fn new_cache(&self) -> KvCache {
+        KvCache {
+            layers: (0..self.blocks.len()).map(|_| None).collect(),
+            len: 0,
+        }
+    }
+
+    /// Reads `tokens` (`[batch, t]`) as the continuation of whatever `cache` already holds and
+    /// returns their logits (`[batch, t, vocab]`), identical to the corresponding rows of
+    /// [`Gpt::forward`] over the whole sequence. Use it for generation: first the prompt, then
+    /// one token at a time.
+    ///
+    /// Panics if the cache would grow beyond [`Gpt::block_size`]. For inference only (it records
+    /// no gradients).
+    pub fn forward_cached(&self, tokens: Tensor<2, Int>, cache: &mut KvCache) -> Tensor<3> {
+        let [_, t] = tokens.dims();
+        let start = cache.len;
+        let total = start + t;
+        assert!(
+            total <= self.block_size,
+            "context of {total} tokens exceeds block_size {}",
+            self.block_size
+        );
+        let half = self.rope_cos.dims()[1];
+        let table = |tab: &Tensor<2>| {
+            tab.clone()
+                .slice([start..total, 0..half])
+                .reshape([1, 1, t, half])
+        };
+        let (cos, sin) = (table(&self.rope_cos), table(&self.rope_sin));
+        let mask = self
+            .causal_mask
+            .clone()
+            .slice([start..total, 0..total])
+            .reshape([1, 1, t, total]);
+
+        let mut x = self.wte.forward(tokens);
+        for (block, layer) in self.blocks.iter().zip(cache.layers.iter_mut()) {
+            x = block.forward_cached(x, &cos, &sin, &mask, layer);
+        }
+        cache.len = total;
         self.head.forward(self.norm_f.forward(x))
     }
 
@@ -260,6 +473,80 @@ mod tests {
     }
 
     #[test]
+    fn cached_forward_reproduces_the_full_forward_pass() {
+        let device = Device::flex();
+        let cfg = Preset::Nano.config(40);
+        let model = cfg.init(&device);
+        let t = 30;
+        let all = tokens(1, t, &device, |_, c| ((c * 37 + 11) % 256) as i32);
+        let full: Vec<f32> = model.forward(all.clone()).into_data().try_to_vec().unwrap();
+
+        // A prompt of 12 tokens, then 5 at once (a non-empty cache with several new tokens),
+        // then one by one.
+        let mut cache = model.new_cache();
+        assert!(cache.is_empty());
+        let mut got: Vec<f32> = Vec::new();
+        let mut at = 0;
+        for chunk in [12usize, 5]
+            .into_iter()
+            .chain(std::iter::repeat_n(1, t - 17))
+        {
+            let ids = all.clone().slice([0..1, at..at + chunk]);
+            let logits = model.forward_cached(ids, &mut cache);
+            got.extend(logits.into_data().try_to_vec::<f32>().unwrap());
+            at += chunk;
+            assert_eq!(cache.len(), at);
+        }
+        assert_eq!(at, t);
+        assert_eq!(got.len(), full.len());
+        let worst = got
+            .iter()
+            .zip(&full)
+            .fold(0.0f32, |m, (a, b)| m.max((a - b).abs()));
+        assert!(
+            worst < 1e-4,
+            "cached logits differ from the full pass by {worst}"
+        );
+
+        cache.clear();
+        assert!(cache.is_empty());
+    }
+
+    #[test]
+    #[should_panic(expected = "exceeds block_size")]
+    fn cached_forward_refuses_to_outgrow_the_context() {
+        let device = Device::flex();
+        let model = Preset::Nano.config(8).init(&device);
+        let mut cache = model.new_cache();
+        let x = tokens(1, 6, &device, |_, c| c as i32);
+        model.forward_cached(x.clone(), &mut cache);
+        model.forward_cached(x, &mut cache);
+    }
+
+    #[test]
+    fn attention_blocks_are_twice_the_head_dimension_within_limits() {
+        assert_eq!(attention_block(8), 32);
+        assert_eq!(attention_block(32), 64);
+        assert_eq!(attention_block(64), 128);
+        assert_eq!(attention_block(512), 256);
+    }
+
+    #[test]
+    fn parameter_count_follows_a_larger_vocabulary() {
+        let device = Device::flex();
+        let cfg = Preset::Nano.config(32).with_vocab(1000);
+        let model = cfg.init(&device);
+        assert_eq!(model.num_params(), cfg.num_params());
+        assert_eq!(
+            cfg.num_params() - Preset::Nano.config(32).num_params(),
+            2 * (1000 - 256) * cfg.d_model,
+            "embedding and head both grow with the vocabulary"
+        );
+        let x = tokens(2, 9, &device, |r, c| ((r * 301 + c * 97) % 1000) as i32);
+        assert_eq!(model.forward(x).dims(), [2, 9, 1000]);
+    }
+
+    #[test]
     fn forward_has_expected_shape_and_is_finite() {
         let device = Device::flex();
         let cfg = Preset::Nano.config(32);
@@ -293,6 +580,85 @@ mod tests {
         // ...while later positions do change.
         let diff: f32 = (10 * v..16 * v).map(|i| (la[i] - lb[i]).abs()).sum();
         assert!(diff > 1e-3);
+    }
+
+    fn max_diff<const D: usize>(a: Tensor<D>, b: Tensor<D>) -> f32 {
+        (a - b).abs().max().into_scalar::<f32>()
+    }
+
+    fn reference_attention(q: Tensor<4>, k: Tensor<4>, v: Tensor<4>) -> Tensor<4> {
+        attention(
+            q,
+            k,
+            v,
+            None,
+            None,
+            AttentionModuleOptions {
+                scale: None,
+                softcap: None,
+                is_causal: true,
+            },
+        )
+    }
+
+    #[test]
+    fn block_attention_matches_burn_attention_values_and_gradients() {
+        use burn::tensor::Distribution;
+        let device = Device::flex().autodiff();
+        let (b, h, t, hd) = (2usize, 3usize, 20usize, 8usize);
+        let dist = Distribution::Normal(0.0, 1.0);
+        let q = Tensor::<4>::random([b, h, t, hd], dist, &device).require_grad();
+        let k = Tensor::<4>::random([b, h, t, hd], dist, &device).require_grad();
+        let v = Tensor::<4>::random([b, h, t, hd], dist, &device).require_grad();
+        let mask = Tensor::<2>::from_data(TensorData::new(causal_mask_values(t), [t, t]), &device)
+            .reshape([1, 1, t, t]);
+
+        let run = |f: &dyn Fn(Tensor<4>, Tensor<4>, Tensor<4>) -> Tensor<4>| {
+            let out = f(q.clone(), k.clone(), v.clone());
+            let grads = out.clone().powf_scalar(2.0).sum().backward();
+            (
+                out.inner(),
+                q.grad(&grads).unwrap(),
+                k.grad(&grads).unwrap(),
+                v.grad(&grads).unwrap(),
+            )
+        };
+        let reference = run(&reference_attention);
+        // 7 gives a ragged last block (20 = 7 + 7 + 6); 64 exercises the single-block path.
+        for block in [7usize, 5, 64] {
+            let got = run(&|q, k, v| causal_attention_blocks(q, k, v, &mask, block));
+            assert!(
+                max_diff(got.0, reference.0.clone()) < 1e-4,
+                "output, block {block}"
+            );
+            assert!(
+                max_diff(got.1, reference.1.clone()) < 1e-3,
+                "dq, block {block}"
+            );
+            assert!(
+                max_diff(got.2, reference.2.clone()) < 1e-3,
+                "dk, block {block}"
+            );
+            assert!(
+                max_diff(got.3, reference.3.clone()) < 1e-3,
+                "dv, block {block}"
+            );
+        }
+    }
+
+    #[test]
+    fn training_and_evaluation_paths_give_the_same_logits() {
+        // The autodiff device uses the block attention, the plain device Burn's fused kernel.
+        let train_dev = Device::flex().autodiff();
+        let cfg = Preset::Nano.config(300); // longer than the attention block (64): several blocks
+        let model = cfg.init(&train_dev);
+        let x = tokens(2, 300, &train_dev, |r, c| ((r * 29 + c * 3) % 256) as i32);
+        let a = model.forward(x.clone());
+
+        let eval_model = model.valid();
+        let x_eval = x.inner();
+        let b = eval_model.forward(x_eval);
+        assert!(max_diff(a.inner(), b) < 1e-3);
     }
 
     #[test]

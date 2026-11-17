@@ -2,8 +2,8 @@
 //!
 //! GERMEN trains a decoder-only transformer ("GPT-style") with pre-norm RMSNorm,
 //! rotary position embeddings, a squared-ReLU feed-forward block and no bias terms.
-//! The vocabulary is byte-level (256 symbols), so any UTF-8 text — Romanian
-//! diacritics included — is representable without an out-of-vocabulary token.
+//! The presets assume the byte-level vocabulary (256 symbols); with a BPE tokenizer use
+//! [`GptConfig::with_vocab`] to match the tokenizer's size.
 
 use burn::prelude::*;
 
@@ -31,6 +31,14 @@ pub struct GptConfig {
 }
 
 impl GptConfig {
+    /// The same architecture with a different vocabulary size (the presets assume the 256
+    /// bytes; a BPE tokenizer brings its own size, which changes the embedding and the output
+    /// head and so the parameter count).
+    pub fn with_vocab(mut self, vocab_size: usize) -> Self {
+        self.vocab_size = vocab_size;
+        self
+    }
+
     /// Width of one attention head.
     pub fn head_dim(&self) -> usize {
         self.d_model / self.n_head

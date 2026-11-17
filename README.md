@@ -6,13 +6,16 @@ No Python, no CUDA, no C or C++ toolchain, no account, no network access, no tel
 One binary, one text file, one command. Built on [Burn](https://burn.dev) 0.22 with its pure-Rust
 `flex` CPU backend.
 
-> Other languages: [Română](README.ro.md) · more translations are planned.
+> Languages: **English** · [Română](README.ro.md) · [Français](README.fr.md) · [Italiano](README.it.md) · [Español](README.es.md) · [Português](README.pt.md) · [Deutsch](README.de.md) · [Magyar](README.hu.md)
 
 ## What it is — and what it is not
 
 GERMEN trains a GPT-style network (RMSNorm, rotary positions, squared-ReLU feed-forward, no biases)
-over **bytes**: the vocabulary is the 256 byte values, so any text — Romanian diacritics
-included — works without a tokenizer to prepare.
+over **tokens**. By default a token is a **byte**: the vocabulary is the 256 byte values, so any
+text — Romanian diacritics included — works with nothing to prepare. With `--tokenizer bpe` GERMEN
+first learns a byte-level BPE vocabulary (up to 65,536 tokens) from your own text, so the same
+context window holds several times more text (typically 3–4× for ordinary prose). The tokenizer is
+stored with the model.
 
 It is a **workshop for learning and experimenting**, and a base for research: you can watch a
 network go from random noise to spelling, punctuation and the style of your text within minutes.
@@ -28,6 +31,7 @@ Visual Studio Build Tools). Then:
 ```bash
 cargo build --release
 ./target/release/germen bench                      # how fast is THIS computer?
+./target/release/germen bench --scaling            # ...and how does it grow with the number of threads?
 ./target/release/germen train --demo --preset micro --steps 300
 ./target/release/germen generate                   # text from the model you just trained
 ```
@@ -37,26 +41,30 @@ On Windows use `target\release\germen.exe`. Pre-built binaries are attached to t
 Train on your own text — any file, any language:
 
 ```bash
-germen train --data my-corpus.txt --preset mini --steps 5000 --out my-model
+germen train --data my-corpus.txt --preset mini --tokenizer bpe --vocab 4096 --steps 5000 --out my-model
 germen generate --model my-model --prompt "Era odată " --max-new 400
 ```
 
 Press **Ctrl-C** during training: it finishes the current step, saves, and exits. Continue later
-with the same command plus `--resume`.
+with the same command plus `--resume`: weights, step counter and AdamW state are restored, so
+training goes on without the loss bump of a cold restart (the random text windows are drawn anew).
 
 ## Commands
 
 | command | what it does |
 |---|---|
 | `germen info` | detected processors and SIMD level, model sizes and memory for the weights |
-| `germen bench` | times real training steps for each model size and extrapolates the time for 100 M and 1 B tokens; `--json FILE` saves the numbers |
+| `germen bench` | times real training steps for each model size and extrapolates the time for 100 M and 1 B tokens; `--scaling` repeats the measurement with 1, 2, 4, … threads and prints the speed-up curve; `--json FILE` saves the numbers |
 | `germen demo-corpus` | writes a synthetic Romanian corpus generated from a small grammar (`--size-mb`) |
 | `germen train` | trains from scratch (`--data FILE` or `--demo`), or continues with `--resume` |
-| `germen generate` | samples text from a trained model (`--temperature`, `--top-k`, `--prompt`) |
+| `germen generate` | samples text from a trained model, with a key/value cache (`--temperature`, `--top-k`, `--prompt`) |
 
-Add `--threads N` to any command to limit the number of worker threads. `germen train --help`
-lists every training option (learning rate, warm-up, weight decay, batch, context, validation
-and checkpoint intervals, …). The messages of the command line are currently in Romanian.
+Training options worth knowing: `--tokenizer byte|bpe` and `--vocab N` (the BPE size);
+`--batch` and `--accum` (gradient accumulation: the effective batch is their product, the memory
+is that of `--batch` alone); `--grad-clip` (global gradient norm, default 1); `--lr`, `--warmup`,
+`--weight-decay`. `germen train --help` lists them all. Add `--threads N` to any command to limit
+the number of worker threads (the default is every logical processor). The messages of the command
+line are currently in Romanian.
 
 ## Model sizes
 
@@ -68,37 +76,43 @@ and checkpoint intervals, …). The messages of the command line are currently i
 | `small` | 25.44 M | 8 × 8 × 512 | 97 MiB |
 | `base` | 85.35 M | 12 × 12 × 768 | 326 MiB |
 
-Training also keeps AdamW's two moment estimates (≈ 4× the weights) plus the activations, which
-grow with `--batch` and `--seq`.
+The sizes are for the 256-token byte vocabulary; a BPE vocabulary of V tokens adds
+2·(V − 256)·width parameters (embedding and output head). Training also keeps AdamW's two moment
+estimates (≈ 4× the weights) plus the activations, which grow with `--batch` and `--seq`.
 
 ## How long does it take?
 
-The cost of training is about **6 × parameters × tokens** floating-point operations (a byte is a
-token, so 1 MB of text = 1 M tokens). Divide by what your CPU really delivers and you have the
-time. `germen bench` measures exactly that on your machine.
+The cost of training is about **6 × parameters × tokens** floating-point operations (with bytes,
+1 MB of text = 1 M tokens). Divide by what your CPU really delivers and you have the time.
+`germen bench` measures exactly that on your machine.
 
-Reference measurement — a small Linux virtual machine with **2 cores** (AVX-512), batch 16 × 256:
+Reference measurement — a small Linux virtual machine with **2 cores** (AVX-512), batch 16 × 256,
+byte vocabulary (one run on a noisy VM, so ± 5 %):
 
 | preset | tokens/s | effective GFLOPS | 100 M tokens | 1 B tokens |
 |---|---:|---:|---:|---:|
-| `nano` | 6,040 | 39 | 4.6 h | 1.9 d |
-| `micro` | 2,362 | 47 | 11.8 h | 4.9 d |
-| `mini` | 1,051 | 75 | 1.0 d | 11 d |
-| `small` | 522 | 86 | 2.1 d | 22 d |
+| `nano` | 8,261 | 54 | 3.4 h | 1.4 d |
+| `micro` | 3,180 | 63 | 8.7 h | 3.6 d |
+| `mini` | 1,260 | 90 | 22.0 h | 9.2 d |
+| `small` | 545 | 90 | 2.1 d | 21 d |
 
-Going from 1 to 2 threads made `mini` 1.44× faster here (730 → 1,051 tokens/s), so do not expect
-20 cores to give 20×: some operations of the CPU backend use a single thread (the `exp`/`erf`
-family, which is why the feed-forward block uses squared ReLU instead of GELU). A desktop with many
-more cores should still be several times faster;
-`cargo run --release -p germen-core --example profile_ops -- N` shows which operations scale.
-**Please run `germen bench --json bench.json` on your machine** — it
+Going from 1 to 2 threads made `mini` 1.51× faster here (825 → 1,247 tokens/s), so do not expect
+20 cores to give 20×. Matrix products scale well (≈ 1.8× on two threads); attention scales
+less (≈ 1.2×), and RMSNorm, rotary embeddings and the AdamW update hardly at all, so on a machine
+with many cores they become the bottleneck (Amdahl's law). That is what
+`germen bench --scaling` is for: it prints the whole curve and the number of threads beyond which
+nothing is gained. **Please run `germen bench --scaling --json bench.json` on your machine** — it
 is the only way to know. A common rule of thumb for compute-optimal training is about 20 tokens
 per parameter; small models are often trained on much more.
+
+Generation uses a key/value cache: 400 tokens from `mini` take about 1 second instead of 15 on the
+same two cores.
 
 ## How it is built
 
 ```
-crates/germen-core   the library: config, model, data, train, generate, checkpoint, bench
+crates/germen-core   the library: config, model, tokenizer, bpe, data, train, gradients,
+                     generate, checkpoint, bench
 crates/germen-cli    the `germen` command line (clap)
 ```
 
@@ -107,22 +121,37 @@ crates/germen-cli    the `germen` command line (clap)
   build therefore still uses AVX2 on a CPU that has it.
 * **Model** — pre-norm blocks, fused QKV projection, causal attention, rotary embeddings,
   untied output head, GPT-2-style initialisation (output projections scaled by `1/√(2·layers)`).
-* **Training** — AdamW (β₂ = 0.95), linear warm-up then cosine decay, validation on fixed windows
-  (reported in nats and bits per byte), atomic checkpoints, progress through `Event` callbacks so
-  a graphical front end can reuse the same loop.
-* **Checkpoint** — a folder with `config.json`, `weights.bpk` (Burn's burnpack, f32) and
-  `meta.json`.
-* **Tests** — 39 unit tests, among them: attention is causal, the initial loss is ln 256, a
-  checkpoint reloads to identical logits, training lowers the loss, `--resume` continues.
+  Training uses a block-wise causal attention that never computes the part above the diagonal
+  (whole steps 8–28 % faster on two cores, depending on the model size; same values and
+  gradients); evaluation uses Burn's fused kernel, and generation a key/value cache.
+* **Tokenizer** — bytes, or a byte-level BPE with a GPT-2-like pre-tokenizer (a space sticks to the
+  word that follows, merges never cross a word). Training of the vocabulary is deterministic and
+  uses the training part of the text only; encoding is parallel; any byte sequence round-trips.
+* **Training** — AdamW (β₂ = 0.95), linear warm-up then cosine decay, global-norm gradient
+  clipping, gradient accumulation, validation on fixed windows (reported in nats per token and
+  bits per byte), atomic checkpoints, progress through `Event` callbacks so a graphical front end
+  can reuse the same loop.
+* **Threads** — the whole command runs as one worker of its own thread pool, which starts parallel
+  loops without a hand-off between threads (+ 7 % for `mini` to + 25 % for `nano` on two cores).
+  Spreading micro-batches over several threads that all drive Burn was tried and rejected; see
+  [docs/PLAN.md](docs/PLAN.md).
+* **Checkpoint** — a folder with `config.json`, `weights.bpk` (Burn's burnpack, f32),
+  `optimizer.bpk` (AdamW moments), `tokenizer.json` and `meta.json`. Checkpoints written by
+  version 0.1 still load.
+* **Tests** — 70 unit tests, among them: attention is causal, block attention equals Burn's
+  attention (values and gradients), cached generation equals the full forward pass, accumulated
+  micro-batches equal one large batch, an optimizer step after reloading the AdamW state equals
+  the step of an uninterrupted run, every byte sequence survives the BPE round trip.
 
-## Limitations (version 0.1)
+## Limitations (version 0.2)
 
-* Byte-level only: sequences are 3–4× longer than with a subword vocabulary. A BPE tokenizer is
-  the next step.
-* `--resume` restores weights and step counter but not AdamW's moments (a small loss bump).
-* No key/value cache: generation re-reads the context window for every new byte.
-* No gradient accumulation, no mixed precision, no GPU backend; gradient clipping is per tensor.
+* The whole corpus is read into memory (as 16-bit token ids); memory-mapped corpora larger than
+  RAM are planned.
+* Several operations of the step (RMSNorm, rotary embeddings, the AdamW update) do not use extra
+  cores well yet; making them parallel is the main open performance item.
+* No mixed precision and no GPU backend.
 * The `demo` corpus is synthetic and tiny: it proves the pipeline learns, nothing more.
+* Not yet measured on Windows, macOS or a machine with many cores — see above for how to help.
 
 See [CHANGELOG.md](CHANGELOG.md) and [docs/PLAN.md](docs/PLAN.md). Contributions are welcome —
 the open issues are a good start ([CONTRIBUTING.md](CONTRIBUTING.md)).

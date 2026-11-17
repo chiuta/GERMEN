@@ -63,6 +63,122 @@ pub struct BenchReport {
     pub optimised_build: bool,
     /// One entry per measured model.
     pub results: Vec<BenchResult>,
+    /// Thread-count sweeps (`germen bench --scaling`), one series per model.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub scaling: Vec<ScalingSeries>,
+}
+
+/// What every measurement of a benchmark run has in common.
+#[derive(Clone, Copy, Debug)]
+pub struct BenchParams {
+    /// Windows per step.
+    pub batch: usize,
+    /// Tokens per window.
+    pub seq: usize,
+    /// Untimed steps before measuring.
+    pub warmup: usize,
+    /// Timed steps.
+    pub steps: usize,
+}
+
+/// One measurement of a thread-count sweep.
+#[derive(Clone, Debug, Serialize)]
+pub struct ScalingPoint {
+    /// Worker threads of the pool this measurement ran on.
+    pub threads: usize,
+    /// The measurement itself.
+    pub result: BenchResult,
+    /// Throughput relative to the first point of the series.
+    pub speedup: f64,
+    /// `speedup` divided by the ratio of thread counts to the first point
+    /// (1.0 = perfect scaling).
+    pub efficiency: f64,
+}
+
+/// Training throughput of one model size at several thread counts.
+#[derive(Clone, Debug, Serialize)]
+pub struct ScalingSeries {
+    /// Preset name (or `"custom"`).
+    pub preset: String,
+    /// Measurements, fewest threads first.
+    pub points: Vec<ScalingPoint>,
+}
+
+impl ScalingSeries {
+    /// The fastest measurement.
+    pub fn best(&self) -> Option<&ScalingPoint> {
+        self.points
+            .iter()
+            .max_by(|a, b| a.result.tokens_per_sec.total_cmp(&b.result.tokens_per_sec))
+    }
+
+    /// The point with the fewest threads that is still within 3 % of the fastest: beyond it,
+    /// extra threads buy almost nothing.
+    pub fn sensible(&self) -> Option<&ScalingPoint> {
+        let best = self.best()?.result.tokens_per_sec;
+        self.points
+            .iter()
+            .filter(|p| p.result.tokens_per_sec >= 0.97 * best)
+            .min_by_key(|p| p.threads)
+    }
+
+    /// Human-readable table.
+    pub fn render(&self) -> String {
+        let mut s = String::new();
+        if let Some(first) = self.points.first() {
+            let r = &first.result;
+            let _ = writeln!(
+                s,
+                "Scalare pe fire — model {} ({:.2}M parametri), lot {}×{}",
+                self.preset,
+                r.params as f64 / 1e6,
+                r.batch,
+                r.seq
+            );
+        }
+        let _ = writeln!(
+            s,
+            "{:>6} {:>9} {:>10} {:>11} {:>10}",
+            "fire", "ms/pas", "tokeni/s", "accelerare", "eficiență"
+        );
+        for p in &self.points {
+            let _ = writeln!(
+                s,
+                "{:>6} {:>9.0} {:>10.0} {:>11} {:>10}",
+                p.threads,
+                p.result.ms_per_step,
+                p.result.tokens_per_sec,
+                format!("{:.2}×", p.speedup),
+                format!("{:.0}%", p.efficiency * 100.0),
+            );
+        }
+        if let (Some(best), Some(sensible)) = (self.best(), self.sensible()) {
+            let _ = writeln!(
+                s,
+                "Cel mai rapid: {} fire ({:.0} tokeni/s).",
+                best.threads, best.result.tokens_per_sec
+            );
+            if sensible.threads < best.threads {
+                let _ = writeln!(
+                    s,
+                    "Cu {} fire se ajunge la {:.0}% din acea viteză; peste atât, firele în plus aduc puțin.",
+                    sensible.threads,
+                    100.0 * sensible.result.tokens_per_sec / best.result.tokens_per_sec
+                );
+            }
+        }
+        s
+    }
+}
+
+/// Thread counts for a sweep up to `max`: 1, 2, 4, 8, … and `max` itself.
+pub fn default_thread_counts(max: usize) -> Vec<usize> {
+    let max = max.max(1);
+    let mut counts: Vec<usize> = std::iter::successors(Some(1usize), |&n| n.checked_mul(2))
+        .take_while(|&n| n < max)
+        .collect();
+    counts.push(max);
+    counts
 }
 
 impl BenchReport {
@@ -76,6 +192,7 @@ impl BenchReport {
             simd: sys::simd_summary(),
             optimised_build: sys::is_optimised_build(),
             results: Vec::new(),
+            scaling: Vec::new(),
         }
     }
 
@@ -100,43 +217,49 @@ impl BenchReport {
                  Folosiți `cargo build --release`."
             );
         }
-        let _ = writeln!(s);
-        let _ = writeln!(
-            s,
-            "{:<7} {:>9} {:>11} {:>9} {:>10} {:>8} {:>10} {:>13} {:>13}",
-            "model",
-            "parametri",
-            "lot×context",
-            "ms/pas",
-            "tokeni/s",
-            "GFLOPS",
-            "RAM vârf",
-            "100M tokeni",
-            "1G tokeni"
-        );
-        for r in &self.results {
-            let ram = r
-                .peak_rss_mib
-                .map_or("—".to_string(), |m| format!("{:.0} MiB", m));
+        if !self.results.is_empty() {
+            let _ = writeln!(s);
             let _ = writeln!(
                 s,
-                "{:<7} {:>8.2}M {:>11} {:>9.0} {:>10.0} {:>8.1} {:>10} {:>13} {:>13}",
-                r.preset,
-                r.params as f64 / 1e6,
-                format!("{}×{}", r.batch, r.seq),
-                r.ms_per_step,
-                r.tokens_per_sec,
-                r.gflops,
-                ram,
-                sys::human_duration(r.eta_secs(1e8)),
-                sys::human_duration(r.eta_secs(1e9)),
+                "{:<7} {:>9} {:>11} {:>9} {:>10} {:>8} {:>10} {:>13} {:>13}",
+                "model",
+                "parametri",
+                "lot×context",
+                "ms/pas",
+                "tokeni/s",
+                "GFLOPS",
+                "RAM vârf",
+                "100M tokeni",
+                "1G tokeni"
+            );
+            for r in &self.results {
+                let ram = r
+                    .peak_rss_mib
+                    .map_or("—".to_string(), |m| format!("{:.0} MiB", m));
+                let _ = writeln!(
+                    s,
+                    "{:<7} {:>8.2}M {:>11} {:>9.0} {:>10.0} {:>8.1} {:>10} {:>13} {:>13}",
+                    r.preset,
+                    r.params as f64 / 1e6,
+                    format!("{}×{}", r.batch, r.seq),
+                    r.ms_per_step,
+                    r.tokens_per_sec,
+                    r.gflops,
+                    ram,
+                    sys::human_duration(r.eta_secs(1e8)),
+                    sys::human_duration(r.eta_secs(1e9)),
+                );
+            }
+            let _ = writeln!(s);
+            let _ = writeln!(
+                s,
+                "Ultimele două coloane sunt estimări liniare din viteza măsurată (fără validare/salvări)."
             );
         }
-        let _ = writeln!(s);
-        let _ = writeln!(
-            s,
-            "Ultimele două coloane sunt estimări liniare din viteza măsurată (fără validare/salvări)."
-        );
+        for series in &self.scaling {
+            let _ = writeln!(s);
+            s.push_str(&series.render());
+        }
         s
     }
 }
@@ -216,10 +339,111 @@ pub fn bench_model(
     })
 }
 
+/// Runs [`bench_model`] once per entry of `threads`, each time on a fresh pool of exactly that
+/// many worker threads, and relates every result to the one with the fewest threads.
+///
+/// `on_point` is called after each measurement (for progress output).
+pub fn bench_scaling(
+    name: &str,
+    cfg: &GptConfig,
+    params: &BenchParams,
+    threads: &[usize],
+    mut on_point: impl FnMut(&ScalingPoint),
+) -> Result<ScalingSeries, String> {
+    let mut counts = threads.to_vec();
+    counts.sort_unstable();
+    counts.dedup();
+    if counts.first().is_none_or(|&n| n == 0) {
+        return Err("numărul de fire trebuie să fie cel puțin 1".into());
+    }
+
+    let mut points: Vec<ScalingPoint> = Vec::with_capacity(counts.len());
+    for &n in &counts {
+        let pool = sys::build_pool(n)?;
+        // `install` makes the pool the one every parallel loop inside the closure runs on.
+        let result = pool.install(|| {
+            bench_model(
+                name,
+                cfg,
+                params.batch,
+                params.seq,
+                params.warmup,
+                params.steps,
+            )
+        })?;
+        let (base_speed, base_threads) = points.first().map_or((result.tokens_per_sec, n), |p| {
+            (p.result.tokens_per_sec, p.threads)
+        });
+        let speedup = result.tokens_per_sec / base_speed;
+        let point = ScalingPoint {
+            threads: n,
+            result,
+            speedup,
+            efficiency: speedup / (n as f64 / base_threads as f64),
+        };
+        on_point(&point);
+        points.push(point);
+    }
+    Ok(ScalingSeries {
+        preset: name.to_string(),
+        points,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::Preset;
+
+    #[test]
+    fn default_thread_counts_double_up_to_the_maximum() {
+        assert_eq!(default_thread_counts(0), vec![1]);
+        assert_eq!(default_thread_counts(1), vec![1]);
+        assert_eq!(default_thread_counts(2), vec![1, 2]);
+        assert_eq!(default_thread_counts(8), vec![1, 2, 4, 8]);
+        assert_eq!(default_thread_counts(20), vec![1, 2, 4, 8, 16, 20]);
+        assert_eq!(default_thread_counts(12), vec![1, 2, 4, 8, 12]);
+    }
+
+    #[test]
+    fn scaling_sweeps_measure_each_thread_count_on_its_own_pool() {
+        let cfg = Preset::Nano.config(32);
+        let params = BenchParams {
+            batch: 2,
+            seq: 16,
+            warmup: 0,
+            steps: 1,
+        };
+        let mut seen = Vec::new();
+        let series =
+            bench_scaling("nano", &cfg, &params, &[2, 1, 2], |p| seen.push(p.threads)).unwrap();
+        assert_eq!(seen, vec![1, 2], "sorted, without duplicates");
+        assert_eq!(series.points.len(), 2);
+        assert!((series.points[0].speedup - 1.0).abs() < 1e-12);
+        assert!((series.points[0].efficiency - 1.0).abs() < 1e-12);
+        assert!(series.points[1].speedup > 0.0);
+        assert!(series.best().is_some() && series.sensible().is_some());
+        assert!(series.sensible().unwrap().threads <= series.best().unwrap().threads);
+        let text = series.render();
+        assert!(text.contains("Scalare pe fire") && text.contains("accelerare"));
+
+        let mut report = BenchReport::new();
+        report.scaling.push(series);
+        assert!(report.to_json().contains("\"efficiency\""));
+        assert!(report.render().contains("Scalare pe fire"));
+
+        assert!(bench_scaling("nano", &cfg, &params, &[], |_| {}).is_err());
+        assert!(bench_scaling("nano", &cfg, &params, &[0, 1], |_| {}).is_err());
+    }
+
+    #[test]
+    fn a_pool_install_changes_the_thread_count_the_backend_sees() {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(3)
+            .build()
+            .unwrap();
+        assert_eq!(pool.install(sys::worker_threads), 3);
+    }
 
     #[test]
     fn bench_runs_and_reports_sane_numbers() {

@@ -6,7 +6,7 @@ Thank you for looking! Small, focused contributions are the easiest to review.
 
 ```bash
 cargo build --release
-cargo test --release --workspace      # 39 tests, a few seconds in release mode
+cargo test --release --workspace      # 70 tests, a few seconds in release mode
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all
 ```
@@ -22,16 +22,17 @@ it is 20–100× slower.
   and telemetry. Optional features (for example a GPU backend) go behind a Cargo feature.
 * **Tests.** New behaviour comes with a test; bug fixes with a test that failed before.
 * **Honest numbers.** If a change claims to be faster, show `germen bench --json` before/after on the
-  same machine.
+  same machine, interleaved over a few runs — a small VM is noisy by ±5 %. `germen bench --scaling`
+  shows whether it helps with many threads.
 * Code and documentation are in English; the command-line messages are Romanian for now, and
   moving them to a message catalogue is one of the starter issues.
 
 ## Good first contributions
 
-Look at the open issues: BPE tokenizer, AdamW state on `--resume`, KV cache, gradient
-accumulation, global-norm clipping, safetensors export, a GUI, translations, and community
-benchmarks. A benchmark from your own computer (`germen bench --json my-cpu.json`) is a perfectly
-good first pull request.
+Look at the open issues: making RMSNorm, rotary embeddings and the AdamW update use more cores,
+memory-mapped corpora, safetensors export, a GUI, translating the command-line messages, and
+community benchmarks. A benchmark from your own computer
+(`germen bench --scaling --json my-cpu.json`) is a perfectly good first pull request.
 
 ## License
 

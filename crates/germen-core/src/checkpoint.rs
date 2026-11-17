@@ -13,6 +13,7 @@
 
 use crate::config::GptConfig;
 use crate::model::Gpt;
+use burn::optim::ModuleOptimizer;
 use burn::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -24,6 +25,8 @@ pub const WEIGHTS_FILE: &str = "weights.bpk";
 pub const CONFIG_FILE: &str = "config.json";
 /// File name of the training metadata.
 pub const META_FILE: &str = "meta.json";
+/// File name of the AdamW moment estimates (needed to resume training exactly).
+pub const OPTIMIZER_FILE: &str = "optimizer.bpk";
 
 /// Training progress stored next to the weights.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -46,8 +49,12 @@ pub struct Meta {
     pub corpus_bytes: usize,
     /// Context length used for training.
     pub seq: usize,
-    /// Windows per step used for training.
+    /// Windows per micro-batch used for training.
     pub batch: usize,
+    /// Micro-batches accumulated per optimizer step (`0` in checkpoints written before 0.2,
+    /// which means 1).
+    #[serde(default)]
+    pub accum: usize,
     /// Wall-clock seconds spent training (sums over resumed runs).
     pub elapsed_secs: f64,
 }
@@ -87,6 +94,35 @@ pub fn save(dir: &Path, model: &Gpt, cfg: &GptConfig, meta: &Meta) -> Result<(),
     write_atomic(&dir.join(CONFIG_FILE), cfg_json.as_bytes())?;
     let meta_json = serde_json::to_string_pretty(meta).map_err(|e| e.to_string())?;
     write_atomic(&dir.join(META_FILE), meta_json.as_bytes())
+}
+
+/// Writes the optimizer state (AdamW moments) to `optimizer.bpk` in `dir`, atomically.
+pub fn save_optimizer(dir: &Path, optim: &ModuleOptimizer) -> Result<(), String> {
+    fs::create_dir_all(dir).map_err(|e| format!("nu pot crea {}: {e}", dir.display()))?;
+    let path = dir.join(OPTIMIZER_FILE);
+    let tmp = tmp_path(&path);
+    optim
+        .save(&tmp)
+        .map_err(|e| format!("nu pot salva starea optimizatorului: {e}"))?;
+    fs::rename(&tmp, &path).map_err(|e| format!("nu pot redenumi în {}: {e}", path.display()))
+}
+
+/// Loads the optimizer state saved next to a checkpoint into `optim`.
+///
+/// Returns the optimizer and whether a state was found; checkpoints written before GERMEN 0.2
+/// have none, and then `optim` is returned unchanged.
+pub fn load_optimizer(
+    dir: &Path,
+    optim: ModuleOptimizer,
+) -> Result<(ModuleOptimizer, bool), String> {
+    let path = dir.join(OPTIMIZER_FILE);
+    if !path.exists() {
+        return Ok((optim, false));
+    }
+    let optim = optim
+        .load(&path)
+        .map_err(|e| format!("nu pot citi {}: {e}", path.display()))?;
+    Ok((optim, true))
 }
 
 /// Reads only the architecture from a checkpoint directory.

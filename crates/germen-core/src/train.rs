@@ -8,10 +8,10 @@ use crate::checkpoint::{self, Meta};
 use crate::config::GptConfig;
 use crate::data::{Corpus, Rng, Split};
 use crate::generate::{SampleOptions, generate};
+use crate::gradients;
 use crate::model::Gpt;
-use crate::tokenizer::ByteTokenizer;
-use burn::grad_clipping::GradientClippingConfig;
-use burn::optim::{AdamWConfig, GradientsParams};
+use crate::tokenizer::Tokenizer;
+use burn::optim::{AdamWConfig, GradientsAccumulator, GradientsParams, ModuleOptimizer};
 use burn::prelude::*;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -22,8 +22,11 @@ use std::time::Instant;
 pub struct TrainOptions {
     /// Total number of optimizer steps (the run ends when this step number is reached).
     pub steps: usize,
-    /// Windows per step.
+    /// Windows per micro-batch (what is held in memory at once).
     pub batch: usize,
+    /// Micro-batches whose gradients are summed before each optimizer step. The effective batch
+    /// is `batch * accum` windows with the memory of `batch`.
+    pub accum: usize,
     /// Tokens per window (context length used for training; at most the model's `block_size`).
     pub seq: usize,
     /// Peak learning rate (reached at the end of the warm-up).
@@ -35,7 +38,8 @@ pub struct TrainOptions {
     pub warmup: usize,
     /// Decoupled weight decay of AdamW.
     pub weight_decay: f32,
-    /// Gradient-norm clip applied to each parameter tensor separately (`0` disables it).
+    /// Clip of the global gradient norm: when the L2 norm of all gradients together exceeds this,
+    /// they are scaled down to it (`0` disables clipping).
     pub grad_clip: f32,
     /// Second-moment decay of AdamW. 0.95 suits short runs better than the 0.999 default.
     pub beta2: f32,
@@ -58,6 +62,7 @@ impl Default for TrainOptions {
         TrainOptions {
             steps: 1000,
             batch: 16,
+            accum: 1,
             seq: 256,
             lr: 6e-4,
             min_lr_ratio: 0.1,
@@ -78,8 +83,8 @@ impl Default for TrainOptions {
 impl TrainOptions {
     /// Checks the options against the model; returns a readable error otherwise.
     pub fn validate(&self, cfg: &GptConfig) -> Result<(), String> {
-        if self.steps == 0 || self.batch == 0 {
-            return Err("--steps și --batch trebuie să fie cel puțin 1".into());
+        if self.steps == 0 || self.batch == 0 || self.accum == 0 {
+            return Err("--steps, --batch și --accum trebuie să fie cel puțin 1".into());
         }
         if self.seq < 2 || self.seq > cfg.block_size {
             return Err(format!(
@@ -138,8 +143,15 @@ pub enum Event<'a> {
         from_step: usize,
         /// Step number at which the run ends.
         total_steps: usize,
-        /// Bytes in the training split.
-        train_bytes: usize,
+        /// Tokens in the training split.
+        train_tokens: usize,
+        /// Average bytes of text per token (1 for the byte tokenizer).
+        bytes_per_token: f64,
+        /// Vocabulary size of the tokenizer.
+        vocab_size: usize,
+        /// When resuming: whether the AdamW moment estimates were restored (checkpoints from
+        /// before GERMEN 0.2 have none and start them from zero).
+        optimizer_restored: bool,
     },
     /// Periodic training progress.
     Step {
@@ -151,6 +163,9 @@ pub enum Event<'a> {
         loss: f32,
         /// Learning rate of the latest step.
         lr: f64,
+        /// Mean global gradient norm over the interval, before clipping (`NaN` when clipping
+        /// is off, because the norm is then not computed).
+        grad_norm: f32,
         /// Training throughput over the interval.
         tokens_per_sec: f64,
         /// Seconds spent training in this run.
@@ -227,7 +242,7 @@ pub fn eval_loss(
     total / batches as f32
 }
 
-fn make_sample(model: &Gpt, device: &Device, seed: u64) -> String {
+fn make_sample(model: &Gpt, tokenizer: &Tokenizer, device: &Device, seed: u64) -> String {
     let opts = SampleOptions {
         max_new: 160,
         temperature: 0.8,
@@ -235,18 +250,22 @@ fn make_sample(model: &Gpt, device: &Device, seed: u64) -> String {
         window: 128,
     };
     let mut rng = Rng::new(seed);
-    let bytes = generate(model, b"", &opts, &mut rng, device, |_| {});
-    ByteTokenizer.decode_complete(&bytes)
+    let tokens = generate(model, tokenizer, b"", &opts, &mut rng, device, |_| {});
+    tokenizer.decode_complete(&tokens)
 }
 
 fn save_checkpoint(
     out_dir: &Path,
     cfg: &GptConfig,
     model: &Gpt,
+    optim: &ModuleOptimizer,
+    tokenizer: &Tokenizer,
     meta: &Meta,
     on_event: &mut dyn FnMut(Event<'_>),
 ) -> Result<(), String> {
     checkpoint::save(out_dir, model, cfg, meta)?;
+    checkpoint::save_optimizer(out_dir, optim)?;
+    tokenizer.save(out_dir)?;
     on_event(Event::Saved {
         step: meta.step,
         dir: out_dir,
@@ -256,8 +275,8 @@ fn save_checkpoint(
 
 /// Trains `cfg` on `corpus` and writes checkpoints into `out_dir`.
 ///
-/// With `resume`, weights, step counter and statistics are restored from `out_dir` (the
-/// optimizer's moment estimates start from zero again). Setting `stop` to `true` from another
+/// With `resume`, weights, step counter, statistics and the optimizer's moment estimates are
+/// restored from `out_dir`. Setting `stop` to `true` from another
 /// thread (e.g. a Ctrl-C handler) ends the run after the current step with a final checkpoint.
 pub fn train(
     corpus: &Corpus,
@@ -270,6 +289,13 @@ pub fn train(
 ) -> Result<TrainReport, String> {
     cfg.validate()?;
     opts.validate(cfg)?;
+    if corpus.tokenizer.vocab_size() != cfg.vocab_size {
+        return Err(format!(
+            "tokenizatorul ({} tokeni) nu se potrivește cu modelul (vocabular {})",
+            corpus.tokenizer.vocab_size(),
+            cfg.vocab_size
+        ));
+    }
     corpus.check_seq(opts.seq)?;
     let est_memory_bytes = cfg.estimate_train_bytes(opts.batch, opts.seq);
     crate::sys::check_memory_fits(est_memory_bytes, opts.batch, opts.seq)?;
@@ -286,6 +312,13 @@ pub fn train(
                         la --resume folosiți aceeași dimensiune de model"
                 .into());
         }
+        if Tokenizer::load(out_dir)? != corpus.tokenizer {
+            return Err(
+                "tokenizatorul din punctul de control diferă de cel al corpusului; \
+                        la --resume trebuie folosit același tokenizator"
+                    .into(),
+            );
+        }
         (m, meta)
     } else {
         (cfg.init(&device), Meta::default())
@@ -295,26 +328,33 @@ pub fn train(
     meta.corpus_bytes = corpus.len();
     meta.seq = opts.seq;
     meta.batch = opts.batch;
+    meta.accum = opts.accum;
 
     let start_step = meta.step;
-    let tokens_per_step = opts.batch * opts.seq;
+    let tokens_per_step = opts.batch * opts.seq * opts.accum;
+
+    // Clipping is done on the global norm by `gradients::clip_global_norm`, not by Burn.
+    let mut optim = AdamWConfig::new()
+        .with_beta_2(opts.beta2)
+        .with_epsilon(1e-8)
+        .with_weight_decay(opts.weight_decay)
+        .init();
+    let mut optimizer_restored = false;
+    if resume {
+        (optim, optimizer_restored) = checkpoint::load_optimizer(out_dir, optim)?;
+    }
+
     on_event(Event::Start {
         params: cfg.num_params(),
         tokens_per_step,
         est_memory_bytes,
         from_step: start_step,
         total_steps: opts.steps,
-        train_bytes: corpus.train.len(),
+        train_tokens: corpus.train.len(),
+        bytes_per_token: corpus.bytes_per_token(),
+        vocab_size: cfg.vocab_size,
+        optimizer_restored,
     });
-
-    let mut adam = AdamWConfig::new()
-        .with_beta_2(opts.beta2)
-        .with_epsilon(1e-8)
-        .with_weight_decay(opts.weight_decay);
-    if opts.grad_clip > 0.0 {
-        adam = adam.with_grad_clipping(Some(GradientClippingConfig::Norm(opts.grad_clip)));
-    }
-    let mut optim = adam.init();
 
     let mut rng = Rng::new(opts.seed ^ (start_step as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15));
     let log_every = opts.log_every.max(1);
@@ -323,6 +363,7 @@ pub fn train(
     let mut train_time = 0.0f64; // seconds spent inside training steps only
     let mut interval_time = 0.0f64;
     let mut interval_loss = 0.0f64;
+    let mut interval_grad_norm = 0.0f64;
     let mut interval_steps = 0usize;
     let mut last_loss = f32::NAN;
     let mut steps_run = 0usize;
@@ -336,24 +377,51 @@ pub fn train(
 
         let started = Instant::now();
         let lr = opts.lr_at(step);
-        let batch = corpus.sample_batch(Split::Train, opts.batch, opts.seq, &mut rng);
-        let (x, y) = batch.to_tensors(&device);
 
-        let loss = model.loss(x, y);
-        last_loss = loss.clone().into_scalar::<f32>();
-        if !last_loss.is_finite() {
+        // Forward and backward over `accum` micro-batches; each loss is divided by `accum`, so
+        // the summed gradients equal those of one batch `accum` times larger.
+        let mut accumulator = GradientsAccumulator::new();
+        let mut step_loss = 0.0f32;
+        for _ in 0..opts.accum {
+            let batch = corpus.sample_batch(Split::Train, opts.batch, opts.seq, &mut rng);
+            let (x, y) = batch.to_tensors(&device);
+            let loss = model.loss(x, y);
+            let value = loss.clone().into_scalar::<f32>();
+            if !value.is_finite() {
+                return Err(format!(
+                    "pierderea a devenit {value} la pasul {step}; reduceți --lr (acum {lr:.2e}) \
+                     sau activați --grad-clip"
+                ));
+            }
+            step_loss += value / opts.accum as f32;
+            let scaled = if opts.accum > 1 {
+                loss.div_scalar(opts.accum as f32)
+            } else {
+                loss
+            };
+            let grads = GradientsParams::from_grads(scaled.backward(), &model);
+            accumulator.accumulate(&model, grads);
+        }
+        last_loss = step_loss;
+        let mut grads = accumulator.grads();
+        let grad_norm = if opts.grad_clip > 0.0 {
+            gradients::clip_global_norm(&mut grads, &model, opts.grad_clip)
+        } else {
+            f32::NAN
+        };
+        if opts.grad_clip > 0.0 && !grad_norm.is_finite() {
             return Err(format!(
-                "pierderea a devenit {last_loss} la pasul {step}; reduceți --lr (acum {lr:.2e}) \
-                 sau activați --grad-clip"
+                "gradientul a devenit non-finit ({grad_norm}) la pasul {step}; reduceți --lr \
+                 (acum {lr:.2e})"
             ));
         }
-        let grads = GradientsParams::from_grads(loss.backward(), &model);
         model = optim.step(lr, model, grads);
 
         let dt = started.elapsed().as_secs_f64();
         train_time += dt;
         interval_time += dt;
         interval_loss += last_loss as f64;
+        interval_grad_norm += grad_norm as f64;
         interval_steps += 1;
         steps_run += 1;
         let done = step + 1;
@@ -371,12 +439,14 @@ pub fn train(
                 total: opts.steps,
                 loss: (interval_loss / interval_steps as f64) as f32,
                 lr,
+                grad_norm: (interval_grad_norm / interval_steps as f64) as f32,
                 tokens_per_sec: (interval_steps * tokens_per_step) as f64 / interval_time.max(1e-9),
                 elapsed: train_time,
                 eta: per_step * (opts.steps - done) as f64,
             });
             interval_time = 0.0;
             interval_loss = 0.0;
+            interval_grad_norm = 0.0;
             interval_steps = 0;
         }
 
@@ -402,7 +472,12 @@ pub fn train(
         }
 
         if opts.sample_every > 0 && done % opts.sample_every == 0 && !is_last {
-            let text = make_sample(&model.valid(), &eval_device, opts.seed ^ done as u64);
+            let text = make_sample(
+                &model.valid(),
+                &corpus.tokenizer,
+                &eval_device,
+                opts.seed ^ done as u64,
+            );
             on_event(Event::Sample {
                 step: done,
                 text: &text,
@@ -410,15 +485,36 @@ pub fn train(
         }
 
         if opts.save_every > 0 && done % opts.save_every == 0 && !is_last {
-            save_checkpoint(out_dir, cfg, &model, &meta, on_event)?;
+            save_checkpoint(
+                out_dir,
+                cfg,
+                &model,
+                &optim,
+                &corpus.tokenizer,
+                &meta,
+                on_event,
+            )?;
         }
     }
 
     // Final checkpoint and sample (also after an interruption).
     meta.elapsed_secs = elapsed_before + train_time;
-    save_checkpoint(out_dir, cfg, &model, &meta, on_event)?;
+    save_checkpoint(
+        out_dir,
+        cfg,
+        &model,
+        &optim,
+        &corpus.tokenizer,
+        &meta,
+        on_event,
+    )?;
     if steps_run > 0 {
-        let text = make_sample(&model.valid(), &eval_device, opts.seed ^ 0xF1A1);
+        let text = make_sample(
+            &model.valid(),
+            &corpus.tokenizer,
+            &eval_device,
+            opts.seed ^ 0xF1A1,
+        );
         on_event(Event::Sample {
             step: meta.step,
             text: &text,
@@ -561,13 +657,24 @@ mod tests {
 
         let mut losses = Vec::new();
         let mut saved = 0;
+        let mut grad_norms = Vec::new();
         let stop = AtomicBool::new(false);
         let report = train(&corpus, &cfg, &opts, &dir, false, &stop, &mut |e| match e {
-            Event::Step { loss, .. } => losses.push(loss),
+            Event::Step {
+                loss, grad_norm, ..
+            } => {
+                losses.push(loss);
+                grad_norms.push(grad_norm);
+            }
             Event::Saved { .. } => saved += 1,
             _ => {}
         })
         .unwrap();
+        assert!(
+            grad_norms.iter().all(|g| g.is_finite() && *g > 0.0),
+            "gradient norms must be reported: {grad_norms:?}"
+        );
+        assert!(dir.join(checkpoint::OPTIMIZER_FILE).exists());
 
         assert_eq!(report.final_step, 30);
         assert_eq!(report.steps_run, 30);
@@ -584,10 +691,178 @@ mod tests {
             steps: 40,
             ..opts.clone()
         };
-        let report2 = train(&corpus, &cfg, &more, &dir, true, &stop, &mut |_| {}).unwrap();
+        let mut restored = None;
+        let report2 = train(&corpus, &cfg, &more, &dir, true, &stop, &mut |e| {
+            if let Event::Start {
+                optimizer_restored, ..
+            } = e
+            {
+                restored = Some(optimizer_restored);
+            }
+        })
+        .unwrap();
+        assert_eq!(restored, Some(true), "AdamW state must be restored");
         assert_eq!(report2.final_step, 40);
         assert_eq!(report2.steps_run, 10);
         assert!(report2.tokens_seen > report.tokens_seen);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn restored_optimizer_state_continues_exactly_like_uninterrupted_training() {
+        let dir = std::env::temp_dir().join(format!("germen-optim-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let device = crate::train_device();
+        let cfg = Preset::Nano.config(16);
+        let adam = || AdamWConfig::new().with_beta_2(0.95).init();
+        let window = |i: usize| {
+            let make = |shift: usize| {
+                let data: Vec<i32> = (0..3 * 16)
+                    .map(|k| ((i * 53 + k * 7 + shift) % 256) as i32)
+                    .collect();
+                Tensor::<2, Int>::from_data(TensorData::new(data, [3, 16]), &device)
+            };
+            (make(0), make(1))
+        };
+        let step = |model: Gpt, optim: &mut ModuleOptimizer, i: usize| {
+            let (x, y) = window(i);
+            let grads = GradientsParams::from_grads(model.loss(x, y).backward(), &model);
+            optim.step(1e-2, model, grads)
+        };
+
+        // Three steps, then a checkpoint.
+        let mut model = cfg.init(&device);
+        let mut optim = adam();
+        for i in 0..3 {
+            model = step(model, &mut optim, i);
+        }
+        checkpoint::save(&dir, &model, &cfg, &Meta::default()).unwrap();
+        checkpoint::save_optimizer(&dir, &optim).unwrap();
+
+        // A: carry on in the same process. B: reload weights and optimizer from disk.
+        // C: reload the weights only (what GERMEN 0.1 did).
+        let a = step(model, &mut optim, 3);
+        let (mb, _, _) = checkpoint::load(&dir, &device).unwrap();
+        let (mut ob, found) = checkpoint::load_optimizer(&dir, adam()).unwrap();
+        assert!(found);
+        let b = step(mb, &mut ob, 3);
+        let (mc, _, _) = checkpoint::load(&dir, &device).unwrap();
+        let c = step(mc, &mut adam(), 3);
+
+        let probe = {
+            let data: Vec<i32> = (0..32).map(|k| k * 13 % 256).collect();
+            Tensor::<2, Int>::from_data(TensorData::new(data, [2, 16]), &eval_dev())
+        };
+        fn eval_dev() -> Device {
+            crate::cpu_device()
+        }
+        let logits = |m: Gpt| m.valid().forward(probe.clone());
+        let max_diff = |p: Tensor<3>, q: Tensor<3>| (p - q).abs().max().into_scalar::<f32>();
+        let (la, lb, lc) = (logits(a), logits(b), logits(c));
+        let restored = max_diff(la.clone(), lb);
+        let fresh = max_diff(la, lc);
+        assert!(restored < 1e-4, "restored run drifted by {restored}");
+        assert!(
+            fresh > 10.0 * restored.max(1e-6),
+            "a fresh optimizer should visibly differ (restored {restored}, fresh {fresh})"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn bpe_run_stores_its_tokenizer_and_resume_insists_on_the_same_one() {
+        use crate::bpe::Bpe;
+        let dir = std::env::temp_dir().join(format!("germen-bpe-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let text = demo_corpus(150_000, 21).into_bytes();
+        let bpe = Bpe::train(&text, 400, &mut |_, _| {}).unwrap();
+        let corpus = Corpus::build(&text, 0.1, Tokenizer::Bpe(bpe)).unwrap();
+        assert!(
+            corpus.bytes_per_token() > 2.5,
+            "{}",
+            corpus.bytes_per_token()
+        );
+        let vocab = corpus.tokenizer.vocab_size();
+        let cfg = Preset::Nano.config(32).with_vocab(vocab);
+        let opts = TrainOptions {
+            steps: 30,
+            batch: 8,
+            seq: 32,
+            lr: 3e-3,
+            warmup: 3,
+            eval_every: 0,
+            save_every: 0,
+            log_every: 5,
+            ..TrainOptions::default()
+        };
+        let stop = AtomicBool::new(false);
+        let mut losses = Vec::new();
+        let mut seen_vocab = 0;
+        train(&corpus, &cfg, &opts, &dir, false, &stop, &mut |e| match e {
+            Event::Step { loss, .. } => losses.push(loss),
+            Event::Start { vocab_size, .. } => seen_vocab = vocab_size,
+            _ => {}
+        })
+        .unwrap();
+        assert_eq!(seen_vocab, vocab);
+        let start = (vocab as f32).ln();
+        assert!(losses[0] > start - 0.6, "{} vs ln(V) = {start}", losses[0]);
+        assert!(losses.last().unwrap() < &(losses[0] - 0.4), "{losses:?}");
+        assert_eq!(Tokenizer::load(&dir).unwrap(), corpus.tokenizer);
+
+        // Resuming with the same tokenizer works...
+        let more = TrainOptions {
+            steps: 36,
+            ..opts.clone()
+        };
+        train(&corpus, &cfg, &more, &dir, true, &stop, &mut |_| {}).unwrap();
+        // ...with a different one (here: bytes, whose vocabulary does not fit the model) it is
+        // refused instead of silently producing garbage.
+        let bytes = Corpus::from_bytes(text.clone(), 0.1).unwrap();
+        let err = train(&bytes, &cfg, &more, &dir, true, &stop, &mut |_| {}).unwrap_err();
+        assert!(err.contains("tokenizator"), "{err}");
+        // Same vocabulary size but a different merge list is caught as well.
+        let other = Bpe::train(&text[..60_000], 400, &mut |_, _| {}).unwrap();
+        if other.vocab_size() == vocab {
+            let c2 = Corpus::build(&text, 0.1, Tokenizer::Bpe(other)).unwrap();
+            let err = train(&c2, &cfg, &more, &dir, true, &stop, &mut |_| {}).unwrap_err();
+            assert!(err.contains("tokenizator"), "{err}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn gradient_accumulation_counts_tokens_and_still_learns() {
+        let dir = std::env::temp_dir().join(format!("germen-accum-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let corpus = Corpus::from_bytes(demo_corpus(60_000, 8).into_bytes(), 0.1).unwrap();
+        let cfg = Preset::Nano.config(32);
+        let opts = TrainOptions {
+            steps: 24,
+            batch: 4,
+            accum: 3,
+            seq: 32,
+            lr: 3e-3,
+            warmup: 3,
+            eval_every: 0,
+            save_every: 0,
+            log_every: 4,
+            ..TrainOptions::default()
+        };
+        let mut tokens_per_step = 0;
+        let mut losses = Vec::new();
+        let stop = AtomicBool::new(false);
+        let report = train(&corpus, &cfg, &opts, &dir, false, &stop, &mut |e| match e {
+            Event::Start {
+                tokens_per_step: t, ..
+            } => tokens_per_step = t,
+            Event::Step { loss, .. } => losses.push(loss),
+            _ => {}
+        })
+        .unwrap();
+        assert_eq!(tokens_per_step, 4 * 32 * 3);
+        assert_eq!(report.tokens_seen, 24 * 4 * 32 * 3);
+        assert!(losses.last().unwrap() < &(losses[0] - 0.3), "{losses:?}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

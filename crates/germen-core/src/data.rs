@@ -1,5 +1,6 @@
 //! Corpus handling, random batches and a built-in synthetic demo corpus.
 
+use crate::tokenizer::{TokenId, Tokenizer};
 use burn::prelude::*;
 use burn::tensor::TensorData;
 use std::path::Path;
@@ -45,18 +46,30 @@ pub enum Split {
     Val,
 }
 
-/// A byte corpus split into a training and a validation part.
+/// A text corpus, already turned into tokens and split into a training and a validation part.
 #[derive(Clone, Debug)]
 pub struct Corpus {
-    /// Training bytes.
-    pub train: Vec<u8>,
-    /// Validation bytes (the tail of the file).
-    pub val: Vec<u8>,
+    /// Training tokens.
+    pub train: Vec<TokenId>,
+    /// Validation tokens (the tail of the text).
+    pub val: Vec<TokenId>,
+    /// The tokenizer that produced the tokens; it is stored with every checkpoint.
+    pub tokenizer: Tokenizer,
+    /// Size of the original text in bytes.
+    pub bytes: usize,
+}
+
+/// Where the validation tail starts in a text of `len` bytes (everything before it is training
+/// data). A tokenizer should be trained on `text[..split_point(..)]` only, so that the
+/// validation text stays unseen.
+pub fn split_point(len: usize, val_fraction: f64) -> usize {
+    len - ((len as f64) * val_fraction) as usize
 }
 
 impl Corpus {
-    /// Splits `bytes`: the last `val_fraction` becomes validation data.
-    pub fn from_bytes(bytes: Vec<u8>, val_fraction: f64) -> Result<Corpus, String> {
+    /// Tokenizes `bytes` with `tokenizer` and splits off the last `val_fraction` as validation
+    /// data (split on the text first, then each part is tokenized on its own).
+    pub fn build(bytes: &[u8], val_fraction: f64, tokenizer: Tokenizer) -> Result<Corpus, String> {
         if !(0.0..0.5).contains(&val_fraction) {
             return Err("val_fraction trebuie să fie în [0, 0.5)".into());
         }
@@ -66,44 +79,57 @@ impl Corpus {
                 bytes.len()
             ));
         }
-        let val_len = ((bytes.len() as f64) * val_fraction) as usize;
-        let split = bytes.len() - val_len;
-        let val = bytes[split..].to_vec();
-        let mut train = bytes;
-        train.truncate(split);
-        Ok(Corpus { train, val })
+        let split = split_point(bytes.len(), val_fraction);
+        let train = tokenizer.encode(&bytes[..split]);
+        let val = tokenizer.encode(&bytes[split..]);
+        Ok(Corpus {
+            train,
+            val,
+            tokenizer,
+            bytes: bytes.len(),
+        })
     }
 
-    /// Reads a file as raw bytes and splits it.
+    /// Byte-level corpus: splits `bytes`, the last `val_fraction` becoming validation data.
+    pub fn from_bytes(bytes: Vec<u8>, val_fraction: f64) -> Result<Corpus, String> {
+        Corpus::build(&bytes, val_fraction, Tokenizer::Byte)
+    }
+
+    /// Reads a file as raw bytes and splits it (byte-level).
     pub fn from_file(path: &Path, val_fraction: f64) -> Result<Corpus, String> {
         let bytes =
             std::fs::read(path).map_err(|e| format!("nu pot citi {}: {e}", path.display()))?;
         Corpus::from_bytes(bytes, val_fraction)
     }
 
-    /// Total number of bytes.
+    /// Total number of tokens.
     pub fn len(&self) -> usize {
         self.train.len() + self.val.len()
     }
 
-    /// Whether the corpus holds no bytes at all.
+    /// Whether the corpus holds no tokens at all.
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
 
-    /// Checks that a window of `seq_len + 1` bytes fits in the training part
+    /// Average bytes of text per token (1.0 for the byte tokenizer; 3–4 for a good BPE).
+    pub fn bytes_per_token(&self) -> f64 {
+        self.bytes as f64 / self.len().max(1) as f64
+    }
+
+    /// Checks that a window of `seq_len + 1` tokens fits in the training part
     /// (and in the validation part when there is one).
     pub fn check_seq(&self, seq_len: usize) -> Result<(), String> {
         if self.train.len() <= seq_len + 1 {
             return Err(format!(
-                "partea de antrenare ({} octeți) e prea mică pentru contextul {seq_len}; \
+                "partea de antrenare ({} tokeni) e prea mică pentru contextul {seq_len}; \
                  reduceți --seq sau folosiți un corpus mai mare",
                 self.train.len()
             ));
         }
         if !self.val.is_empty() && self.val.len() <= seq_len + 1 {
             return Err(format!(
-                "partea de validare ({} octeți) e prea mică pentru contextul {seq_len}; \
+                "partea de validare ({} tokeni) e prea mică pentru contextul {seq_len}; \
                  reduceți --seq sau --val-fraction",
                 self.val.len()
             ));
@@ -111,7 +137,7 @@ impl Corpus {
         Ok(())
     }
 
-    fn part(&self, split: Split) -> &[u8] {
+    fn part(&self, split: Split) -> &[TokenId] {
         match split {
             Split::Train => &self.train,
             Split::Val => {
@@ -126,7 +152,7 @@ impl Corpus {
 
     /// Draws `batch` random windows of `seq` tokens; targets are the inputs shifted by one.
     ///
-    /// Panics if the chosen part holds fewer than `seq + 2` bytes (see [`Corpus::check_seq`]).
+    /// Panics if the chosen part holds fewer than `seq + 2` tokens (see [`Corpus::check_seq`]).
     pub fn sample_batch(&self, split: Split, batch: usize, seq: usize, rng: &mut Rng) -> Batch {
         let data = self.part(split);
         assert!(data.len() > seq + 1, "corpus part too small for seq={seq}");
