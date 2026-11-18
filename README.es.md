@@ -194,7 +194,7 @@ crates/germen-cli    la línea de comandos `germen` (clap)
   Content-Security-Policy que deja ejecutar exactamente un script; cada una de estas puertas la
   atacan pruebas sobre un socket real y la apagan por turno 18 pruebas por mutación, que las
   pruebas deben notar ([docs/STUDIO.md](docs/STUDIO.md)).
-* **Pruebas** — 247 pruebas (unitarias de la biblioteca, de la línea de comandos y de la interfaz
+* **Pruebas** — 251 pruebas (unitarias de la biblioteca, de la línea de comandos y de la interfaz
   gráfica, más ejecuciones completas del binario real y del servidor por un socket), entre ellas: la
   atención es causal, la atención por bloques iguala la de Burn (valores y gradientes), la
   generación con caché iguala el paso completo, los micro-lotes acumulados equivalen a un lote
@@ -205,8 +205,17 @@ crates/germen-cli    la línea de comandos `germen` (clap)
   bytes sobrevive al viaje de ida y vuelta por el BPE. Un bit cambiado en un archivo del punto de
   control se detecta y se nombra el archivo, y un guardado interrumpido en cualquier momento se
   completa o se descarta. La auditoría adversarial está en [docs/AUDIT.md](docs/AUDIT.md).
+* **Comprobado con implementaciones independientes** (0.6) — la red, el paso de AdamW y el tokenizador
+  BPE se reescribieron en NumPy y en Python simple y se compararon número a número: los logits, la
+  pérdida, el gradiente de cada parámetro (por diferencias finitas) y cinco pasos del optimizador
+  coinciden hasta el redondeo (error relativo inferior a 10⁻⁴), y cada fusión del tokenizador es
+  idéntica. Con la receta de Shakespeare a nivel de carácter del README de nanoGPT, un modelo `nano`
+  llega a unos 1,72 nats por byte frente a los 1,88 que documenta nanoGPT (las recetas difieren: véase
+  la parte IV de [docs/AUDIT.md](docs/AUDIT.md)). El decaimiento de pesos solo alcanza a las matrices,
+  y un entrenamiento detenido y reanudado es idéntico a uno sin interrupción. No se compararon la
+  velocidad frente a otros frameworks ni los modelos mayores frente a la referencia de GPU de nanoGPT.
 
-## Límites (versión 0.5)
+## Límites (versión 0.6)
 
 * Las sumas de comprobación protegen de los accidentes (un bit cambiado, un archivo truncado,
   archivos de dos guardados distintos), no de quien también pueda editar `meta.json`; los puntos de

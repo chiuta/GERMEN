@@ -33,6 +33,14 @@ impl Rng {
         })
     }
 
+    /// The generator of one training step: it depends on the run's `seed` and on the step's index
+    /// and on nothing else, so a run that is stopped and resumed draws, from the step where it
+    /// resumes, the very windows an uninterrupted run draws (before 0.6.0 one generator was
+    /// consumed across the steps and restarted at every resume, so a resumed run saw other data).
+    pub fn for_step(seed: u64, step: usize) -> Self {
+        Rng::new(splitmix64(seed).rotate_left(17) ^ splitmix64(step as u64 ^ 0x5DEE_CE66_D1CE_4E5B))
+    }
+
     /// Next 64 random bits.
     pub fn next_u64(&mut self) -> u64 {
         let mut x = self.0;
@@ -421,6 +429,29 @@ mod tests {
             assert_eq!(targets, batch.targets);
         }
         assert_eq!(batch.split(0).len(), 1, "zero parts means one");
+    }
+
+    #[test]
+    fn every_step_of_every_run_has_its_own_stream_and_the_same_every_time() {
+        use std::collections::HashSet;
+        let first = |seed: u64, step: usize| Rng::for_step(seed, step).next_u64();
+        assert_eq!(
+            first(7, 3),
+            first(7, 3),
+            "a step draws the same windows every time"
+        );
+        let mut seen = HashSet::new();
+        for seed in 0..40u64 {
+            for step in 0..400usize {
+                assert!(
+                    seen.insert(first(seed, step)),
+                    "seed {seed}, step {step} repeats a stream"
+                );
+            }
+        }
+        // Not symmetric in its two arguments, and a step is not the seed's next stream.
+        assert_ne!(first(1, 2), first(2, 1));
+        assert_ne!(first(5, 0), Rng::new(5).next_u64());
     }
 
     #[test]

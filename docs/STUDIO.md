@@ -1,6 +1,6 @@
 # GERMEN Studio
 
-`germen ui` — the graphical interface of GERMEN (version 0.5). A window in which you choose a text,
+`germen ui` — the graphical interface of GERMEN (since version 0.5). A window in which you choose a text,
 press **Start** and watch a model learn: the loss curve, the learning rate, the speed, and samples
 of what the network writes as it improves. Everything the command line can do is there, with the
 same code underneath: the Studio calls the library, it does not run `germen` as a subprocess.

@@ -6,6 +6,44 @@ All notable changes to GERMEN are listed here. The format follows
 
 ## [Unreleased]
 
+## [0.6.0] — 2026-11-18
+
+A fourth round of the adversarial audit, this time **against independent implementations**: the network, the
+optimizer and the tokenizer were re-written in a few hundred lines of numpy and plain Python and compared with
+the Rust code number by number. The arithmetic agreed; three defects of *behaviour* did not survive the
+comparison and are fixed below. Details, the comparison with nanoGPT and how to repeat everything are in
+Part IV of [docs/AUDIT.md](docs/AUDIT.md). The presentation page and every README are updated in the eight
+languages.
+
+### Changed
+- **The RMSNorm gains are no longer decayed** (D-01). `--weight-decay` now reaches the matrices and the
+  embedding only, as in nanoGPT, llm.c and the GPT-3 recipe; up to 0.5.0 it also pulled the gains (the
+  `gamma` of each normalisation, which the loss holds near 1) towards zero, by `lr × weight-decay` of their
+  value at every step. With the defaults that is 0.7 % over 2,000 steps; with the nanoGPT recipe
+  (`--lr 1e-3 --weight-decay 0.1`) 10 %. Models trained with 0.5.0 load and generate exactly as before;
+  continuing one with 0.6.0 simply stops decaying the gains.
+- **A stopped and resumed run is now numerically identical to an uninterrupted one** (D-02). Every step draws
+  its windows from its own stream, `Rng::for_step(seed, step)`; before, one generator was restarted at every
+  `--resume`, so the resumed run trained on other windows than the same run without the pause. Consequence:
+  **the same `--seed` gives other batches than in 0.5.0**, so a run is not bit-for-bit repeatable across the
+  two versions (a model is not worse or better for it; on the Shakespeare runs of the audit the difference
+  between seeds is about 0.01 nat). Same machine, thread count, replicas, options and seed: same weights.
+
+### Fixed
+- `--lr × --weight-decay` of 1 or more is refused with a message naming both (D-03): from 1 on the factor
+  `1 − lr × wd` of AdamW no longer shrinks the weights, it flips their sign and makes them grow
+  (`--weight-decay 1e9` used to be accepted and trained noise).
+- A test of the Studio that tried a wrong last character of the token could pick the very character the
+  token ends with and fail one run in sixteen (it failed once, on Windows, in CI).
+
+### Added
+- `germen-core/examples/reference_dump.rs` + `scripts/reference_check.py`: the model, its gradients, five AdamW
+  steps and the three ways of computing attention (training, evaluation, cached) against a float64 numpy
+  reference and central finite differences. `examples/bpe_dump.rs` + `scripts/reference_bpe.py`: the BPE
+  against a naive implementation of the documented rules. Neither runs in CI; the first takes a few minutes with its finite-difference gradients (`--skip-gradients`: seconds), the second seconds.
+- 4 new tests (153 + 1 ignored in the library; 251 in all, from 247) and 6 more mutation proofs (`D-01a` … `D-03`, 24 in
+  all), all caught. `scripts/audit_fuzz.py` no longer tries `--out /` when it runs as root, where that is a
+  legitimate request and writes a model there.
 - A presentation page in the eight languages of the project (`index.html`, one self-contained file with no
   external request, built around a real recording of a training run) and the Studio's demonstration page
   (`demo.html`), both served by GitHub Pages at `germen.chiuta.ro`. No change to the program.

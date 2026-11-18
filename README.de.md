@@ -200,7 +200,7 @@ crates/germen-cli    die Kommandozeile `germen` (clap)
   laufen lässt; jedes dieser Tore wird von Tests über einen echten Socket angegriffen und der Reihe
   nach von 18 Mutationsbeweisen abgeschaltet, die die Tests bemerken müssen
   ([docs/STUDIO.md](docs/STUDIO.md)).
-* **Tests** — 247 Tests (Unit-Tests der Bibliothek, der Kommandozeile und der grafischen Oberfläche
+* **Tests** — 251 Tests (Unit-Tests der Bibliothek, der Kommandozeile und der grafischen Oberfläche
   sowie vollständige Läufe des echten Binärprogramms und des Servers über einen Socket), darunter:
   Die Attention ist kausal, die blockweise Attention gleicht der von Burn (Werte und Gradienten),
   die Generierung mit Cache gleicht dem vollständigen Durchlauf, akkumulierte Mikro-Batches
@@ -212,8 +212,18 @@ crates/germen-cli    die Kommandozeile `germen` (clap)
   Checkpoint-Datei wird erkannt und die Datei benannt, und ein zu jedem Zeitpunkt unterbrochenes
   Speichern wird abgeschlossen oder verworfen. Das adversariale Audit steht in
   [docs/AUDIT.md](docs/AUDIT.md).
+* **Gegen unabhängige Implementierungen geprüft** (0.6) — das Netz, der AdamW-Schritt und der
+  BPE-Tokenizer wurden in NumPy und reinem Python neu geschrieben und Zahl für Zahl verglichen: die
+  Logits, der Verlust, der Gradient jedes Parameters (per finiten Differenzen) und fünf
+  Optimiererschritte stimmen bis auf Rundung überein (relativer Fehler unter 10⁻⁴), und jede
+  Verschmelzung des Tokenizers ist identisch. Mit dem zeichenbasierten Shakespeare-Rezept aus der
+  README von nanoGPT erreicht ein `nano`-Modell etwa 1,72 Nat pro Byte, gegenüber den 1,88, die
+  nanoGPT dokumentiert (die Rezepte unterscheiden sich: siehe Teil IV von
+  [docs/AUDIT.md](docs/AUDIT.md)). Der Gewichtszerfall betrifft nur die Matrizen, und ein angehaltenes
+  und fortgesetztes Training ist identisch mit einem ununterbrochenen. Die Geschwindigkeit gegenüber
+  anderen Frameworks und größere Modelle gegenüber der GPU-Basis von nanoGPT wurden nicht verglichen.
 
-## Grenzen (Version 0.5)
+## Grenzen (Version 0.6)
 
 * Die Prüfsummen schützen vor Unfällen (ein gekipptes Bit, eine abgeschnittene Datei, Dateien aus
   zwei verschiedenen Speicherständen), nicht vor jemandem, der auch `meta.json` ändern kann; vor 0.4

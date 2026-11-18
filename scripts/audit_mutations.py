@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Mutation proofs for docs/AUDIT.md (round 2, and the Studio of 0.5.0: entries T-xx).
+"""Mutation proofs for docs/AUDIT.md (round 2; the Studio of 0.5.0: entries T-xx; round 4: D-xx).
 
 For each entry one defect is put back (or one line of the fast SHA-256 is broken), the tests that
 are meant to guard against it are run, and at least one of them must FAIL; the file is restored
@@ -203,6 +203,28 @@ mut("T-17 a fresh training over a trained model is accepted",
 mut("T-18 the page's Close does not close the server",
     API, "            shared.request_shutdown();\n            Ok(Response::ok(&json!({ \"ok\": true })))", "            Ok(Response::ok(&json!({ \"ok\": true })))",
     STUDIO + "--test http the_page_can_close_the_server")
+
+# --- round 4 (0.6.0): what a run learns from, and what the optimizer may touch
+TRAIN = "crates/germen-core/src/train.rs"
+mut("D-01a the weight decay reaches the norm gains again (the step is a plain AdamW step)",
+    TRAIN, "    if weight_decay <= 0.0 {\n        return optim.step(lr, model, grads);\n    }",
+    "    if true {\n        return optim.step(lr, model, grads);\n    }",
+    CORE + "weight_decay_reaches_the_matrices_but_not_the_norm_gains")
+mut("D-01b the training loop takes the plain AdamW step",
+    TRAIN, "model = adamw_step(&mut optim, lr, opts.weight_decay, model, grads);", "model = optim.step(lr, model, grads);",
+    CORE + "the_training_loop_leaves_the_norm_gains_alone")
+mut("D-01c the decay is given back to the matrices too",
+    TRAIN, "        if D != 1 {\n            return param;\n        }\n        let old = self.old.next()", "        let old = self.old.next()",
+    CORE + "weight_decay_reaches_the_matrices_but_not_the_norm_gains")
+mut("D-03 lr x weight decay of 1 or more is accepted",
+    TRAIN, "        if decay >= 1.0 {", "        if decay >= 1.0e300 {",
+    CORE + "options_validation_rejects_values_that_would_break_the_run")
+mut("D-02a a resume draws other windows (the stream depends on where the run was resumed)",
+    TRAIN, "let mut rng = Rng::for_step(opts.seed, step);", "let mut rng = Rng::for_step(opts.seed ^ start_step as u64, step);",
+    CORE + "a_run_that_is_stopped_and_resumed_equals_an_uninterrupted_one")
+mut("D-02b every step draws the same windows",
+    "crates/germen-core/src/data.rs", "splitmix64(step as u64 ^ 0x5DEE_CE66_D1CE_4E5B)", "splitmix64(0x5DEE_CE66_D1CE_4E5B)",
+    CORE + "every_step_of_every_run_has_its_own_stream")
 
 only = sys.argv[1:]
 summary = []

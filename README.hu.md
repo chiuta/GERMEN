@@ -193,7 +193,7 @@ crates/germen-cli    a `germen` parancssor (clap)
   egy Content-Security-Policy, amely pontosan egy szkriptet enged futni; ezeket a kapukat valódi
   socketen át támadó tesztek vizsgálják, és sorra kikapcsolja 18 mutációs bizonyíték, amelyet a
   teszteknek észre kell venniük ([docs/STUDIO.md](docs/STUDIO.md)).
-* **Tesztek** — 247 teszt (a könyvtár, a parancssor és a grafikus felület egységtesztjei, valamint a
+* **Tesztek** — 251 teszt (a könyvtár, a parancssor és a grafikus felület egységtesztjei, valamint a
   valódi bináris és a szerver teljes futtatásai egy socketen át), köztük: a figyelem oksági, a
   blokkos figyelem megegyezik a Burnéval (értékek és gradiensek), a gyorsítótáras generálás
   megegyezik a teljes átfutással, a felhalmozott mikro-kötegek egyenértékűek egy nagy köteggel, a
@@ -204,8 +204,17 @@ crates/germen-cli    a `germen` parancssor (clap)
   az oda-vissza utat a BPE-n. Egy ellenőrzőpont-fájlban megbillent bitet észrevesz és megnevezi a
   fájlt, a bármikor megszakadt mentést pedig befejezi vagy eldobja. Az ellenséges szemléletű
   auditról a [docs/AUDIT.md](docs/AUDIT.md) szól.
+* **Független megvalósításokkal ellenőrizve** (0.6) — a hálót, az AdamW-lépést és a BPE-tokenizálót
+  újraírtuk NumPy-ban és egyszerű Pythonban, és számról számra összehasonlítottuk: a logitok, a
+  veszteség, minden paraméter gradiense (véges differenciákkal) és az optimalizáló öt lépése a
+  kerekítés erejéig egyezik (relatív hiba 10⁻⁴ alatt), a tokenizáló minden összevonása azonos. A
+  nanoGPT README-jének karakterszintű Shakespeare-receptjén egy `nano` modell kb. 1,72 nat/bájtot ér
+  el, szemben a nanoGPT által dokumentált 1,88-cal (a receptek eltérnek: lásd a
+  [docs/AUDIT.md](docs/AUDIT.md) IV. részét). A súlycsökkentés csak a mátrixokat érinti, a
+  megállított, majd folytatott tanítás pedig azonos a megszakítás nélkülivel. A más keretrendszerekkel
+  való sebességet és a nagyobb modelleket a nanoGPT GPU-alapjához nem hasonlítottuk.
 
-## Korlátok (0.5-ös verzió)
+## Korlátok (0.6-os verzió)
 
 * Az ellenőrző összegek a balesetek ellen védenek (megbillent bit, csonka fájl, két különböző mentés
   fájljai), nem az ellen, aki a `meta.json`-t is át tudja írni; a 0.4 előtt írt ellenőrzőpontok nem

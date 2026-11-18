@@ -338,7 +338,7 @@ def cli_suite(binary, work, rng, workers):
             jobs.append((f"train {opt} {v!r}", args, opt in long_ok or opt == "--steps"))
     for opt, vals in (("--preset", ["", "xxl", "NANO", "all", "nano,micro"]),
                       ("--tokenizer", ["", "foo", "BPE", "byte,bpe"]),
-                      ("--out", ["", "/", "/dev/null", "/proc/x", "/nonexistent/x/y", "."]),
+                      ("--out", ["", "/dev/null", "/proc/x", "/nonexistent/x/y", "."] + ([] if os.geteuid() == 0 else ["/"])),  # as root "/" is writable: a legitimate model there, not a failure
                       ("--data", ["", "/nonexistent", "/", "/dev/null", "/dev/zero", "/etc/shadow"])):
         for v in vals:
             args = [a for a in base_train if a != "--demo"]

@@ -184,7 +184,7 @@ crates/germen-cli    the `germen` command line (clap)
   Content-Security-Policy that lets exactly one script run; each of these gates is attacked by
   tests over a real socket and switched off in turn by 18 mutation proofs, which the tests must
   notice ([docs/STUDIO.md](docs/STUDIO.md)).
-* **Tests** — 247 tests (unit tests of the library, of the command line and of the Studio, and
+* **Tests** — 251 tests (unit tests of the library, of the command line and of the Studio, and
   end-to-end runs of the real binary and of the server over a socket), among them: attention is
   causal, block attention equals Burn's attention (values and gradients), cached generation equals
   the full forward pass, accumulated micro-batches equal one large batch, replicas give the
@@ -194,8 +194,17 @@ crates/germen-cli    the `germen` command line (clap)
   refused, every byte sequence survives the BPE round trip. A flipped bit in a checkpoint file is
   caught and the file named, and a save cut off at any moment is completed or discarded. The
   adversarial audit is in [docs/AUDIT.md](docs/AUDIT.md).
+* **Checked against independent implementations** (0.6) — the network, the AdamW step and the BPE
+  tokenizer were re-written in NumPy and plain Python and compared number by number: the logits, the
+  loss, the gradient of every parameter (by finite differences) and five optimizer steps agree to
+  rounding (relative error below 10⁻⁴) and every merge of the tokenizer is identical. On the
+  character-level Shakespeare recipe of nanoGPT's README a `nano` model reaches about 1.72 nats per
+  byte against the 1.88 that nanoGPT documents (the recipes differ: see Part IV of
+  [docs/AUDIT.md](docs/AUDIT.md)). Weight decay reaches the matrices only, and a stopped and resumed
+  run is identical to an uninterrupted one. Speed against other frameworks, and larger models against
+  nanoGPT's GPU baseline, were not compared.
 
-## Limitations (version 0.5)
+## Limitations (version 0.6)
 
 * The checksums guard against accidents (a flipped bit, a truncated file, files of two different
   saves), not against someone who can edit `meta.json` as well; checkpoints written before 0.4

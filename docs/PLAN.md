@@ -1,6 +1,6 @@
 # GERMEN — plan and decisions
 
-Status: version 0.5.0 (November 2026). The name is provisional; check it against trademark
+Status: version 0.6.0 (November 2026). The name is provisional; check it against trademark
 databases (EUIPO / TMview) before any public launch.
 
 ## 1. Goal
@@ -129,9 +129,13 @@ feed-forward and attention blocks.
 * **0.5 (done)** — GERMEN Studio, the graphical interface (`germen ui`): live curves and samples,
   models, writing, speed, eight languages; a review of its server ([STUDIO.md](STUDIO.md),
   [AUDIT.md](AUDIT.md) Part III) and a demonstration page.
-* **0.6** — memory-mapped corpora larger than RAM; safetensors export/import; whatever the first
+* **0.6 (done)** — fourth audit round, against independent implementations ([AUDIT.md](AUDIT.md), Part IV):
+  the network, AdamW and the BPE re-written in NumPy and Python and compared number by number; weight
+  decay only on the matrices, exact resume (a stream per step), a limit on `lr × weight-decay`; a comparison
+  with nanoGPT's CPU recipe.
+* **0.7** — memory-mapped corpora larger than RAM; safetensors export/import; whatever the first
   many-core measurement calls for; the Studio on Windows and macOS with real users (§7).
-* **0.7** — opt-in GPU backend (`wgpu`) behind a Cargo feature; community benchmark table.
+* **0.8** — opt-in GPU backend (`wgpu`) behind a Cargo feature; community benchmark table.
 * **1.0** — the command-line messages in the project's usual languages; releases for Windows,
   Linux and macOS built by CI; a second adversarial audit (by someone other than the author of the
   code) before the announcement.
@@ -155,7 +159,7 @@ feed-forward and attention blocks.
 
 ## 7. What has been verified so far
 
-* 247 tests pass (release build, Linux): unit tests of the library, of the command line and of the
+* 251 tests pass (release build, Linux): unit tests of the library, of the command line and of the
   Studio, and end-to-end runs of the real binary and of the server over a socket. The core suite ran 40 times in a row in parallel mode
   without a failure; before the fix of A-24 it failed in 2 of 13 runs.
 * The adversarial audit of 0.2 ([AUDIT.md](AUDIT.md), Part I): 15 findings reproduced against a
@@ -180,10 +184,17 @@ feed-forward and attention blocks.
   driven in Chromium (every page and flow, eight languages, five widths, axe-core, forced colours
   by emulation, the demonstration page end to end). What that does not cover is in [STUDIO.md](STUDIO.md) §9.
 * CI on the pushed commits `26d0581` and `303cfb3` (every job green): `rustfmt`, `clippy -D warnings`
-  with the newest stable Rust, the 247 tests on Ubuntu 26.04, Windows and macOS (the two tests of the
+  with the newest stable Rust, the tests on Ubuntu 26.04, Windows and macOS (the two tests of the
   command start `germen ui` on each) and a build with Rust 1.95; and the dependency audit on `26d0581`
   (the one that changed `Cargo.lock`).
-* **Not verified:** Windows and macOS beyond the CI smoke run (no real-size training or speed
+* The audit of 0.5.0 against independent implementations (Part IV): logits of the three paths, loss, the
+  gradient of every parameter (finite differences), five AdamW steps and every BPE merge agree with a NumPy /
+  plain-Python reference to rounding; three defects of behaviour (decayed gains, inexact resume, an unbounded
+  `lr × weight-decay`) and one gap in the tests found and fixed in 0.6.0, each with a mutation proof; on the
+  Shakespeare recipe of nanoGPT's README a `nano` model reaches about 1.72 nats per byte (nanoGPT documents
+  about 1.88; the recipes differ).
+* **Not verified:** speed against other frameworks, models above a few million parameters against nanoGPT's
+  GPU baseline, Windows and macOS beyond the CI smoke run (no real-size training or speed
   figures there, and the rename retry has never met a real antivirus scanner); anything on more
   than two cores; anything beyond the 85 M `base` preset; any real-world corpus; loading a GERMEN
   model in another engine.

@@ -1,6 +1,6 @@
 # Adversarial audit of GERMEN — findings, fixes and what remains
 
-Three rounds, the first two on 17 November 2026 and the third on 18 November 2026, all done by the
+Four rounds, the first two on 17 November 2026 and the third and fourth on 18 November 2026, all done by the
 people who wrote the code (the author and an AI assistant), so "adversarial" means *tried hard to
 break it*, not an independent review: [PLAN.md](PLAN.md) schedules one by someone else before 1.0.
 
@@ -9,6 +9,9 @@ break it*, not an independent review: [PLAN.md](PLAN.md) schedules one by someon
   Findings `B-01` … `B-10`. Where it changes something Part I said, §4 says so in place.
 * **Part III — round 3** (sections 13–18): the Studio of 0.5.0 (`germen ui`), the only part of GERMEN
   that listens on a socket. Findings `C-01` … `C-12`, and 18 mutation proofs of its gates.
+* **Part IV — round 4** (sections 19–25): the network, the optimizer and the tokenizer of 0.5.0 checked against
+  **independent implementations**, and a comparison with nanoGPT. Findings `D-01` … `D-04`, fixed in 0.6.0, and
+  6 more mutation proofs (24 in all).
 
 # Part I — round 1: 0.2.0 → 0.3.0
 
@@ -824,3 +827,185 @@ germen ui --write-demo demo.html
 # the page in a browser: start it, open the address it prints, and follow the sweeps of STUDIO.md §8
 germen ui --workspace /tmp/gw
 ```
+
+
+# Part IV — round 4: independent implementations, 0.5.0 → 0.6.0
+
+## 19. Scope and method
+
+Rounds 1 to 3 looked for ways to make GERMEN fail. Round 4 asks a different question: *is what it computes
+the right thing?* A test written by the author of a function shares the author's idea of what the function
+is for, so three parts were re-written by a second implementation that shares **no code and no automatic
+differentiation** with the first, and compared number by number.
+
+| Part | Reference | What is compared |
+|---|---|---|
+| the network | `scripts/reference_check.py`: the architecture of [PLAN.md](PLAN.md) in float64 NumPy (pre-norm blocks, RMSNorm with a gain, fused q/k/v, rotary embeddings in the rotate-half layout, causal attention scaled by 1/√head_dim, squared-ReLU feed-forward, untied head, mean cross-entropy) | the logits of the three paths of the model (training with blocked attention, evaluation with Burn's fused attention, cached generation with the key/value cache), the loss, and **the gradient of every parameter by central finite differences** (ε = 10⁻⁵) |
+| the optimizer | the same script: AdamW written by hand (decoupled decay `p ← p·(1 − lr·wd)`, bias-corrected moments, ε outside the square root) | five steps at five different learning rates, every parameter |
+| the tokenizer | `scripts/reference_bpe.py`: a naive byte-pair encoder that recounts every pair from scratch at each merge (no heap, no incremental counts, no cache, no threads) and follows only the rules written in `bpe.rs` | the list of merges, the tokens of the training text, the tokens of a different text, and decoding |
+
+The Rust side is dumped by two examples that are not part of the program
+(`crates/germen-core/examples/reference_dump.rs`, which gives the model deterministic random weights and
+writes weights, batch, loss, logits, gradients and the AdamW steps as JSON, and `bpe_dump.rs`).
+
+Also in this round: the fuzz harness of round 2 was run again on the 0.6.0 build (2,501 runs over checkpoints,
+JSON, the command line, text and the disk: 0 bad by the harness's own criteria: no hang, no panic, no crash; the harness's own line is
+in §20.2), and the Shakespeare runs of §21 were made on both versions. **The same limits apply as in the other parts**: the author and an AI
+assistant, on one machine (Linux, 2 virtual CPUs, 8 GB), not an independent review.
+
+**Severity** is that of §1; evidence codes: **I** — found by an independent implementation, **R** — reproduced
+by a test of the command or the library, **M** — found by a mutation proof that the tests did not notice.
+
+## 20. Findings
+
+### 20.1 What agreed (not findings)
+
+| Comparison | Largest difference | Allowed |
+|---|---|---|
+| logits, training path (blocked attention) | 9 × 10⁻⁶ (scale 6.7) | 2 × 10⁻⁴ of the scale |
+| logits, evaluation path (fused attention) | 1.4 × 10⁻⁵ | the same |
+| logits, cached path (three chunks: 20 + 17 + 1 × 33 tokens) | 7 × 10⁻⁶ | the same |
+| loss | 2 × 10⁻⁷ | 2 × 10⁻⁴ |
+| gradient of each of the 15 parameter tensors, by finite differences | 8 × 10⁻⁷ (scale 0.07 … 0.33) | 2 × 10⁻⁴ of the scale |
+| AdamW, five steps, every parameter | 3 × 10⁻⁷ | 10⁻⁵ of the scale |
+| the same on a model with `d_model` 128 and 300 tokens, so that attention is blocked in three | 5 × 10⁻⁴ on logits of scale 17 (3 × 10⁻⁵ relative); AdamW 3 × 10⁻⁷ | the same |
+| causality: logits of earlier tokens when a later one is changed | 0 | 0 |
+| BPE, 600 entries trained on 200 kB of text | 344 of 344 merges equal; the 92,812 tokens of the training text and the 30,849 of another text equal; decoding gives the text back | exact |
+
+The weights are `f32` in Rust and `f64` in the reference, so differences of 10⁻⁵ to 10⁻⁷ are rounding; no
+comparison was close to its limit, and none had to be loosened to pass. The finite-difference check covers
+every element of every tensor, including the gains of the normalisations and the embedding. The larger
+model's gradients were not checked this way (the reference is a Python loop: hours); its logits, loss and
+optimizer were.
+
+### 20.2 Findings
+
+| ID | Severity | What 0.5.0 does | Evidence | Now (0.6.0) |
+|---|---|---|---|---|
+| D-01 | Medium | `--weight-decay` also pulls the RMSNorm gains towards zero (AdamW decays every parameter). The loss is trying to keep a gain near 1; the decay shrinks it by `lr·wd` of its value at every step: 0.7 % over 2,000 steps at the defaults, **10 %** with the nanoGPT recipe (`lr 1e-3`, `wd 0.1`), 6 % over 20,000 steps at the defaults. nanoGPT, llm.c and the GPT-3 recipe decay matrices only | I | `train::adamw_step`: the step is taken as usual and the decay that fell on the one-dimensional parameters is given back (`p_old·lr·wd` added), so a gain moves by its own update only. Verified against the hand-written AdamW (the matrices are still decayed exactly as before) and by two tests |
+| D-02 | Medium | a run that is stopped and resumed is not the run that was not stopped: one generator drew the training windows and a resume restarted it, so the resumed half trained on other windows than the same steps of an uninterrupted run. Nothing is lost, but "the same seed gives the same model" was false across a pause, and the pause could not be told from a change of the data | R | every step draws from its own stream, `Rng::for_step(seed, step)`. A test trains 6 steps straight, and 3 + 3 with a stop between, and compares the weights as numbers (the files differ in their bytes: they carry the parameters' random ids): **equal**. *Behaviour change:* the same `--seed` draws other windows than in 0.5.0 |
+| D-03 | Low | `--lr × --weight-decay` ≥ 1 is accepted. The factor `1 − lr·wd` is then zero or negative: the weights flip sign at every step and grow. `--weight-decay 1e9` trained a model of noise without a word | R | refused before anything starts, with a message that names both options and the product |
+| D-04 | Test gap | the mutation "every step draws the same windows" (D-02b) was **not** caught: nothing tested that two steps, or two seeds, draw different data | M | a test that every (seed, step) pair has its own stream and the same one every time |
+
+D-01 and D-02 are defects of what the program *does*, not of its arithmetic: both were invisible to every
+earlier test, and both are found only by asking what a reference implementation of the *recipe* (nanoGPT's)
+would do. Neither changes the format of a checkpoint: a model trained with 0.5.0 loads and generates as before.
+
+**An error in this round's own draft, caught before release.** The comment that sizes D-01 first said "3 % in
+all"; the computation (`1 − (1 − lr·wd)^steps`, 2,000 steps, `lr·wd = 10⁻⁴`) gives 18 % at the *peak* rate
+and, with the cosine schedule that brings the rate down to a tenth, **10 %**. The comment, the changelog and
+this page say 10 %.
+
+**A line in the harness.** The fuzz harness tries `--out /` among its hostile values and expects a refusal.
+Run as root (as in this sandbox) the request is legitimate and succeeded: it wrote a checkpoint into the
+root of the machine, which then made a test of the Studio fail (`/` "holds a model"). It is not a defect of
+GERMEN, which does what it is asked; the harness now skips that value when it runs as root.
+
+## 21. Comparison with nanoGPT
+
+nanoGPT is the reference that most readers know. Its README gives a recipe for a computer without a GPU:
+character-level Shakespeare, 4 layers, 4 heads, 128 dimensions, a context of 64, batch 12, 2,000 iterations,
+no dropout, validation loss about 1.88; on a GPU (A100, a model of 10.7 M parameters, about three minutes)
+1.47. GERMEN was trained on the same text (`tinyshakespeare`, 1,115,394 bytes), with the same shape. The two
+0.6.0 rows were run with exactly the command below; the two 0.5.0 rows were run earlier in the round with the
+same preset, context, batch and steps, and options that were not written down, so they are shown as a spread
+and not as a measurement:
+
+```sh
+germen train --data input.txt --out run --preset nano --seq 64 --batch 12 --steps 2000 \
+             --lr 0.001 --eval-every 250 --eval-batches 20 --weight-decay W --seed 1
+```
+
+| Run | Validation loss (nats per byte) | Time (2 virtual CPUs) |
+|---|---|---|
+| GERMEN 0.5.0, seed 1 | 1.7166 | 125 s |
+| GERMEN 0.5.0, seed 2 | 1.7250 | 133 s |
+| GERMEN 0.6.0, seed 1, `--weight-decay 0.01` (the default) | 1.7262 | 211 s (other jobs were running) |
+| GERMEN 0.6.0, seed 1, `--weight-decay 0.1` (nanoGPT's) | 1.7274 | 226 s (the same) |
+| nanoGPT, CPU recipe (published) | ≈ 1.88 | not comparable (other machine) |
+
+**Reading.** On this recipe GERMEN reaches a validation loss about 0.15 nat lower than the one nanoGPT
+documents. The spread between seeds and versions (1.717 … 1.727) is about a hundredth, so the difference
+is real but should not be over-read, for these reasons, all of which favour or disfavour GERMEN by unknown
+amounts:
+
+* The architectures differ (rotary embeddings, RMSNorm and a squared-ReLU feed-forward in GERMEN; learned
+  positions, LayerNorm and GELU in nanoGPT), and so do the initialisation and the schedule.
+* nanoGPT's tokens are the 65 characters of the file; GERMEN's are bytes (256, of which the file uses 65), so
+  the two start from different untrained losses (ln 65 and ln 256) and the per-token figures are close but not
+  strictly the same quantity.
+* The validation text differs: the last 5 % of the file here, the last 10 % in nanoGPT.
+* The 1.88 is the figure in nanoGPT's README, not a run on this machine; **nanoGPT was not run here**.
+
+**What this does show:** that the network, once checked against a reference, learns at least as well as the
+well-known recipe on a task small enough to run here; and that `--weight-decay 0.1` does not change the result
+at this size (1.7274 against 1.7262), so the default `0.01` stays. A larger model, a longer run or another text
+could rank them differently: that was not tried.
+
+**Speed is not compared.** GERMEN's throughput is in the README (13,229 tokens/s for `nano` in the
+recording of 0.6.0, on 2 virtual CPUs); no other framework was run on this machine.
+
+## 22. Mutation proofs
+
+Six more entries in [`scripts/audit_mutations.py`](../scripts/audit_mutations.py) (`D-xx`): the defect is put
+back, the tests must fail, the source is restored.
+
+| Entry | The mutation | Caught by |
+|---|---|---|
+| D-01a | the weight decay reaches the norm gains again (a plain AdamW step) | `weight_decay_reaches_the_matrices_but_not_the_norm_gains` |
+| D-01b | the training loop takes the plain AdamW step | `the_training_loop_leaves_the_norm_gains_alone_whatever_the_weight_decay` |
+| D-01c | the decay is given back to the matrices too | the same two tests |
+| D-02a | a resume draws other windows | `a_run_that_is_stopped_and_resumed_equals_an_uninterrupted_one` |
+| D-02b | every step draws the same windows | `every_step_of_every_run_has_its_own_stream_and_the_same_every_time` (new: D-04) |
+| D-03 | `lr × weight-decay` of 1 or more is accepted | the table of bad options |
+
+All six are CAUGHT. With the 18 of round 3 (§15) that makes 24 proofs for the last two rounds, besides those
+of rounds 1 and 2, and every one is caught.
+
+## 23. Trade-offs and residual risks
+
+* **The same seed, other batches.** A model trained with 0.6.0 cannot be reproduced from a 0.5.0 command line.
+  This is the price of D-02; the alternative (keeping the old stream) would have kept resume inexact.
+* **Exact resume has conditions**: the same machine, thread count, replica count, options and seed. With a
+  different number of threads or replicas the gradients are probably summed in another order, so the weights
+  would differ by rounding but not by data; this was not tested.
+* **Decaying only the matrices is a choice**, shared with the recipes it follows; it is not proven better for
+  these sizes. At 2,000 steps it changed nothing measurable.
+* **The gains' share is given back after the step**, not skipped, because Burn's AdamW has no per-parameter
+  exemption: the result equals "no decay" up to one rounding of `f32`, not bit for bit.
+
+## 24. What has not been verified
+
+* **Speed against other frameworks** (candle, llm.c, PyTorch on the same CPU): not run.
+* **Quality at 10 M parameters and above** against nanoGPT's GPU baseline (1.47): not run; the comparison of
+  §21 is the small CPU recipe only.
+* **The gradients of a large model** by finite differences; the logits, the loss and AdamW were checked there.
+* **Windows and macOS numerics**: the tests pass there in CI, the reference comparison was run on Linux only.
+* **The sampler's distribution** beyond the existing test (temperature, top-k, top-p against an independent
+  sampler).
+* **BPE against other tokenizers** (Hugging Face, tiktoken): their pre-tokenizers differ by design, so only the
+  rules written in `bpe.rs` were checked, against a naive implementation of themselves.
+* **An independent review**, still pending (see [PLAN.md](PLAN.md)).
+
+## 25. Reproducing round 4
+
+```sh
+# the network and the optimizer against NumPy (about 35 s with the gradients; --skip-gradients: seconds):
+cargo run --release -p germen-core --example reference_dump -- /tmp/ref.json
+python3 scripts/reference_check.py /tmp/ref.json
+# a model with attention in several blocks (d_model 128, 300 tokens); skip the Python gradient loop:
+cargo run --release -p germen-core --example reference_dump -- /tmp/ref_big.json 128 2 256 2 300
+python3 scripts/reference_check.py /tmp/ref_big.json --skip-gradients
+# the tokenizer against the naive one:
+cargo run --release -p germen-core --example bpe_dump -- train.txt 600 /tmp/bpe.json probe.txt
+python3 scripts/reference_bpe.py train.txt 600 /tmp/bpe.json probe.txt
+# the six mutation proofs of this round, and the hostile-input harness:
+python3 scripts/audit_mutations.py D-
+python3 scripts/audit_fuzz.py --bin target/release/germen
+# the comparison of §21 (the text is Karpathy's tinyshakespeare, "input.txt"):
+germen train --data input.txt --out run --preset nano --seq 64 --batch 12 --steps 2000 \
+             --lr 0.001 --eval-every 250 --eval-batches 20 --seed 1
+```
+
+Sources of the published figures: [nanoGPT README](https://github.com/karpathy/nanoGPT) (the CPU recipe with
+loss ≈ 1.88 and the GPU baseline of 1.47 for the 10.7 M-parameter model).

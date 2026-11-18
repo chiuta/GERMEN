@@ -12,6 +12,7 @@ use crate::generate::{SampleOptions, generate};
 use crate::gradients;
 use crate::model::Gpt;
 use crate::tokenizer::Tokenizer;
+use burn::module::{Module, ModuleMapper, ModuleVisitor, Param};
 use burn::optim::{AdamWConfig, GradientsAccumulator, GradientsParams, ModuleOptimizer};
 use burn::prelude::*;
 use rayon::prelude::*;
@@ -121,6 +122,15 @@ impl TrainOptions {
         }
         if !(self.weight_decay.is_finite() && self.weight_decay >= 0.0) {
             return Err("--weight-decay trebuie să fie un număr finit, cel puțin 0".into());
+        }
+        // AdamW multiplies every weight by `1 - lr * weight_decay` at each step: from 1 on that no
+        // longer shrinks the weights, it flips their sign and makes them grow (`--weight-decay 1e9`
+        // used to be accepted and trained a model of noise).
+        let decay = self.lr * self.weight_decay as f64;
+        if decay >= 1.0 {
+            return Err(format!(
+                "--lr × --weight-decay ({decay}) trebuie să fie sub 1: de la 1 în sus descompunerea                  ponderilor le răstoarnă semnul în loc să le micșoreze"
+            ));
         }
         // NaN used to compare false with `> 0` and switch the clipping off without a word.
         if !(self.grad_clip.is_finite() && self.grad_clip >= 0.0) {
@@ -315,6 +325,76 @@ fn save_checkpoint(
         dir: out_dir,
     });
     Ok(())
+}
+
+/// Values of the one-dimensional parameters of a model, in visiting order. In a [`Gpt`] those are
+/// exactly the gains of the RMSNorm layers; every other parameter is a matrix.
+struct Gains(Vec<Tensor<1>>);
+
+impl ModuleVisitor for Gains {
+    fn visit_float<const D: usize>(&mut self, param: &Param<Tensor<D>>) {
+        if D == 1 {
+            let t = param.val().detach();
+            let n = t.dims().iter().product::<usize>();
+            self.0.push(t.reshape([n]));
+        }
+    }
+}
+
+/// Puts back, on every one-dimensional parameter, the share of its own old value that AdamW's
+/// decoupled decay took away: `p * (1 - lr * wd) - lr * u` becomes `p - lr * u`.
+struct GiveBack {
+    old: std::vec::IntoIter<Tensor<1>>,
+    by: f32,
+}
+
+impl ModuleMapper for GiveBack {
+    fn map_float<const D: usize>(&mut self, param: Param<Tensor<D>>) -> Param<Tensor<D>> {
+        if D != 1 {
+            return param;
+        }
+        let old = self.old.next().expect("one old gain for every gain");
+        let by = self.by;
+        param.map(|t| {
+            let (dims, device, tracked) = (t.dims(), t.device(), t.is_require_grad());
+            let n = dims.iter().product::<usize>();
+            let back = (t.detach().reshape([n]) + old.mul_scalar(by)).reshape(dims);
+            // A computed tensor is not a leaf of the autodiff graph, and a parameter must be one:
+            // go through the values (a handful of numbers per layer).
+            let leaf = Tensor::<D>::from_data(back.into_data(), &device);
+            if tracked { leaf.require_grad() } else { leaf }
+        })
+    }
+}
+
+/// One AdamW step in which the weight decay reaches the matrices (and the embedding) but not the
+/// RMSNorm gains, as in nanoGPT, llm.c and the GPT-3 recipe: a decay pulls a weight towards zero,
+/// which regularises a matrix and only shrinks a gain that the loss is trying to hold at about one.
+/// Up to 0.5.0 the gains were decayed too, by `lr * weight_decay` of their value at every step:
+/// 10 % in all over 2 000 steps at `lr = 1e-3`, `weight_decay = 0.1` (the nanoGPT recipe), 0.7 %
+/// at the defaults for 2 000 steps and 6 % for 20 000.
+///
+/// Burn's AdamW has no per-parameter exemption, so the step is taken as usual and the decay that
+/// was applied to the gains is given back: the decay is `p ← p · (1 − lr · wd)` before the update
+/// (verified against a hand-written AdamW in `scripts/reference_check.py`), so adding `p_old · lr ·
+/// wd` afterwards leaves exactly `p_old − lr · update`, up to one rounding.
+pub fn adamw_step(
+    optim: &mut ModuleOptimizer,
+    lr: f64,
+    weight_decay: f32,
+    model: Gpt,
+    grads: GradientsParams,
+) -> Gpt {
+    if weight_decay <= 0.0 {
+        return optim.step(lr, model, grads);
+    }
+    let mut gains = Gains(Vec::new());
+    model.visit(&mut gains);
+    let stepped = optim.step(lr, model, grads);
+    stepped.map(&mut GiveBack {
+        old: gains.0.into_iter(),
+        by: (lr * weight_decay as f64) as f32,
+    })
 }
 
 /// How many replicas to run per micro-batch of `batch` windows of `seq` tokens.
@@ -616,7 +696,6 @@ pub fn train(
         });
     }
 
-    let mut rng = Rng::new(opts.seed ^ (start_step as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15));
     let log_every = opts.log_every.max(1);
     let elapsed_before = meta.elapsed_secs;
 
@@ -637,6 +716,7 @@ pub fn train(
 
         let started = Instant::now();
         let lr = opts.lr_at(step);
+        let mut rng = Rng::for_step(opts.seed, step);
 
         let Some((mut grads, step_loss)) = accumulate_gradients(
             &model,
@@ -665,7 +745,7 @@ pub fn train(
                  (acum {lr:.2e})"
             ));
         }
-        model = optim.step(lr, model, grads);
+        model = adamw_step(&mut optim, lr, opts.weight_decay, model, grads);
 
         let dt = started.elapsed().as_secs_f64();
         train_time += dt;
@@ -909,6 +989,128 @@ mod tests {
         (corpus, cfg, opts)
     }
 
+    /// Gains (one-dimensional parameters) and everything else, flattened, of a model.
+    fn gains_and_matrices(model: &Gpt) -> (Vec<f32>, Vec<f32>) {
+        struct Split(Vec<f32>, Vec<f32>);
+        impl ModuleVisitor for Split {
+            fn visit_float<const D: usize>(&mut self, p: &Param<Tensor<D>>) {
+                let v = p.val().into_data().try_to_vec::<f32>().unwrap();
+                if D == 1 {
+                    self.0.extend(v);
+                } else {
+                    self.1.extend(v);
+                }
+            }
+        }
+        let mut s = Split(vec![], vec![]);
+        model.visit(&mut s);
+        (s.0, s.1)
+    }
+
+    #[test]
+    fn weight_decay_reaches_the_matrices_but_not_the_norm_gains() {
+        let device = crate::train_device();
+        let cfg = Preset::Nano.config(16);
+        let model = cfg.init_seeded(&device, 1);
+        let data = |shift: usize| {
+            let v: Vec<i32> = (0..2 * 16)
+                .map(|k| ((k * 7 + shift) % 256) as i32)
+                .collect();
+            Tensor::<2, Int>::from_data(TensorData::new(v, [2, 16]), &device)
+        };
+        let grads = || GradientsParams::from_grads(model.loss(data(0), data(1)).backward(), &model);
+        // A decay big enough to see: 5 % of every weight per step.
+        let (lr, wd) = (0.1f64, 0.5f32);
+        let adam = |wd: f32| {
+            AdamWConfig::new()
+                .with_beta_2(0.95)
+                .with_weight_decay(wd)
+                .init()
+        };
+
+        let without = adam(0.0).step(lr, model.clone(), grads());
+        let with = adam(wd).step(lr, model.clone(), grads());
+        let spared = adamw_step(&mut adam(wd), lr, wd, model.clone(), grads());
+        let (g_without, _) = gains_and_matrices(&without);
+        let (g_with, m_with) = gains_and_matrices(&with);
+        let (g_spared, m_spared) = gains_and_matrices(&spared);
+        assert!(!g_without.is_empty());
+
+        // The plain step does decay the gains (this is what the test would catch) ...
+        let moved = g_with
+            .iter()
+            .zip(&g_without)
+            .fold(0.0f32, |m, (a, b)| m.max((a - b).abs()));
+        assert!(
+            moved > 0.04,
+            "the decay should be visible on the gains: {moved}"
+        );
+        // ... the spared step leaves them as if there were no decay ...
+        for (a, b) in g_spared.iter().zip(&g_without) {
+            assert!((a - b).abs() < 1e-6, "gain {a} vs {b}");
+        }
+        // ... and every matrix is decayed exactly as before.
+        assert_eq!(m_spared, m_with);
+    }
+
+    #[test]
+    fn the_training_loop_leaves_the_norm_gains_alone_whatever_the_weight_decay() {
+        // A decay of 100 * lr = 10 % per step would take the gains from 1 to about 0.6 in five
+        // steps; their own updates (lr = 1e-3) move them by a few thousandths.
+        let dir = scratch("gains");
+        let (corpus, cfg, mut opts) = small_run(5);
+        opts.weight_decay = 100.0;
+        opts.lr = 1e-3;
+        opts.warmup = 0;
+        let never = AtomicBool::new(false);
+        train(&corpus, &cfg, &opts, &dir, false, &never, &mut |_| {}).unwrap();
+        let (model, _, _) = checkpoint::load(&dir, &crate::train_device()).unwrap();
+        let (gains, matrices) = gains_and_matrices(&model);
+        assert!(!gains.is_empty());
+        for g in &gains {
+            assert!((g - 1.0).abs() < 0.05, "a gain moved to {g}");
+        }
+        // ... while the matrices were decayed hard (their initial scale is about 0.02).
+        let rms = (matrices.iter().map(|v| v * v).sum::<f32>() / matrices.len() as f32).sqrt();
+        assert!(rms < 0.02 * 0.7, "the matrices were not decayed: rms {rms}");
+    }
+
+    #[test]
+    fn a_run_that_is_stopped_and_resumed_equals_an_uninterrupted_one() {
+        // Until 0.6.0 the windows of a run came from one generator that a resume restarted, so a
+        // resumed run trained on other data than the same run without the pause.
+        for replicas in [1usize, 2] {
+            let (corpus, cfg, mut opts) = small_run(10);
+            opts.replicas = replicas;
+            let straight = scratch(&format!("straight-{replicas}"));
+            let paused = scratch(&format!("paused-{replicas}"));
+            let never = AtomicBool::new(false);
+            train(&corpus, &cfg, &opts, &straight, false, &never, &mut |_| {}).unwrap();
+
+            let stop = AtomicBool::new(false);
+            let first = train(&corpus, &cfg, &opts, &paused, false, &stop, &mut |e| {
+                if let Event::Step { step: 4, .. } = e {
+                    stop.store(true, Ordering::Relaxed);
+                }
+            })
+            .unwrap();
+            assert!(first.interrupted && first.final_step == 4, "{first:?}");
+            let rest = train(&corpus, &cfg, &opts, &paused, true, &never, &mut |_| {}).unwrap();
+            assert_eq!(rest.final_step, 10);
+
+            // The files themselves differ in their bytes (they carry the parameters' random ids),
+            // so the weights are compared as numbers: not "about equal" but equal.
+            let device = crate::train_device();
+            let (a, _, _) = checkpoint::load(&straight, &device).unwrap();
+            let (b, _, _) = checkpoint::load(&paused, &device).unwrap();
+            assert_eq!(
+                gains_and_matrices(&a),
+                gains_and_matrices(&b),
+                "weights differ after a pause ({replicas} replicas)"
+            );
+        }
+    }
+
     #[test]
     fn a_fresh_run_does_not_silently_replace_a_trained_checkpoint() {
         // The commonest slip: running the same command again without --resume. Until 0.4.0 the
@@ -1141,6 +1343,14 @@ mod tests {
                 "beta2 NaN",
                 TrainOptions {
                     beta2: f32::NAN,
+                    ..base.clone()
+                },
+            ),
+            (
+                "lr x weight decay of 1 or more",
+                TrainOptions {
+                    lr: 0.5,
+                    weight_decay: 2.0,
                     ..base.clone()
                 },
             ),

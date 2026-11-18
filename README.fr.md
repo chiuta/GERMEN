@@ -198,7 +198,7 @@ crates/germen-cli    la ligne de commande `germen` (clap)
   une Content-Security-Policy qui ne laisse s'exécuter qu'un seul script ; chacune de ces portes est
   attaquée par des tests sur un vrai socket et coupée tour à tour par 18 preuves par mutation, que
   les tests doivent remarquer ([docs/STUDIO.md](docs/STUDIO.md)).
-* **Tests** — 247 tests (unitaires de la bibliothèque, de la ligne de commande et de l'interface
+* **Tests** — 251 tests (unitaires de la bibliothèque, de la ligne de commande et de l'interface
   graphique, plus des exécutions complètes du vrai binaire et du serveur par un socket), dont :
   l'attention est causale, l'attention par blocs égale celle de Burn (valeurs et gradients), la
   génération avec cache égale la passe complète, des micro-lots accumulés valent un grand lot, les
@@ -209,8 +209,18 @@ crates/germen-cli    la ligne de commande `germen` (clap)
   toute suite d'octets survit à l'aller-retour par le BPE. Un bit modifié dans un fichier du point
   de contrôle est détecté et le fichier nommé, et une sauvegarde interrompue à n'importe quel moment
   est terminée ou abandonnée. L'audit adversarial est dans [docs/AUDIT.md](docs/AUDIT.md).
+* **Vérifié contre des implémentations indépendantes** (0.6) — le réseau, le pas AdamW et le tokenizer
+  BPE ont été réécrits en NumPy et en Python pur, puis comparés nombre à nombre : les logits, la
+  perte, le gradient de chaque paramètre (par différences finies) et cinq pas de l'optimiseur
+  concordent à l'arrondi près (erreur relative inférieure à 10⁻⁴), et chaque fusion du tokenizer est
+  identique. Sur la recette Shakespeare au niveau du caractère du README de nanoGPT, un modèle `nano`
+  atteint environ 1,72 nat par octet, contre 1,88 documenté par nanoGPT (les recettes diffèrent : voir
+  la partie IV de [docs/AUDIT.md](docs/AUDIT.md)). La décroissance des poids ne touche que les
+  matrices, et un entraînement arrêté puis repris est identique à un entraînement ininterrompu. La
+  vitesse face à d'autres frameworks et les modèles plus grands face à la référence GPU de nanoGPT
+  n'ont pas été comparés.
 
-## Limites (version 0.5)
+## Limites (version 0.6)
 
 * Les sommes de contrôle protègent des accidents (un bit modifié, un fichier tronqué, des fichiers
   de deux sauvegardes différentes), pas de quelqu'un qui peut aussi modifier `meta.json` ; les

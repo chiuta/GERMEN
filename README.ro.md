@@ -193,7 +193,7 @@ crates/germen-cli    linia de comandă `germen` (clap)
   Content-Security-Policy care lasă să ruleze exact un script; fiecare dintre aceste porți e atacată
   de teste printr-un socket real și oprită pe rând de 18 dovezi prin mutație, pe care testele
   trebuie să le observe ([docs/STUDIO.md](docs/STUDIO.md)).
-* **Teste** — 247 de teste (unitare ale bibliotecii, ale liniei de comandă și ale interfeței
+* **Teste** — 251 de teste (unitare ale bibliotecii, ale liniei de comandă și ale interfeței
   grafice, plus rulări complete ale executabilului real și ale serverului printr-un socket), între
   care: atenția e cauzală, atenția pe blocuri e egală cu cea a lui Burn (valori și gradienți),
   generarea cu cache dă aceleași rezultate ca trecerea completă, micro-loturile acumulate
@@ -204,8 +204,17 @@ crates/germen-cli    linia de comandă `germen` (clap)
   șir de octeți supraviețuiește turului complet prin BPE. Un bit schimbat într-un fișier al
   punctului de control e prins și fișierul e numit, iar o salvare întreruptă oricând e terminată sau
   aruncată. Auditul adversarial e în [docs/AUDIT.md](docs/AUDIT.md).
+* **Verificat cu implementări independente** (0.6) — rețeaua, pasul AdamW și tokenizatorul BPE au fost
+  rescrise în NumPy și Python simplu și comparate număr cu număr: logiții, pierderea, gradientul
+  fiecărui parametru (prin diferențe finite) și cinci pași ai optimizatorului coincid până la
+  rotunjire (eroare relativă sub 10⁻⁴), iar fiecare îmbinare a tokenizatorului e identică. Pe rețeta
+  Shakespeare la nivel de caracter din README-ul nanoGPT, un model `nano` ajunge la circa 1,72 nats pe
+  octet, față de 1,88 cât documentează nanoGPT (rețetele diferă: vedeți partea IV din
+  [docs/AUDIT.md](docs/AUDIT.md)). Descompunerea ponderilor ajunge doar la matrice, iar o rulare
+  oprită și reluată e identică cu una neîntreruptă. Viteza față de alte cadre și modelele mai mari
+  față de baza GPU a nanoGPT nu au fost comparate.
 
-## Limite (versiunea 0.5)
+## Limite (versiunea 0.6)
 
 * Sumele de control apără de accidente (un bit schimbat, un fișier trunchiat, fișiere din două
   salvări diferite), nu de cineva care poate edita și `meta.json`; punctele de control scrise

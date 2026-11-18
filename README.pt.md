@@ -194,7 +194,7 @@ crates/germen-cli    a linha de comando `germen` (clap)
   rodar exatamente um script; cada uma dessas portas é atacada por testes sobre um socket real e
   desligada, uma por vez, por 18 provas por mutação, que os testes precisam notar
   ([docs/STUDIO.md](docs/STUDIO.md)).
-* **Testes** — 247 testes (unitários da biblioteca, da linha de comando e da interface gráfica, mais
+* **Testes** — 251 testes (unitários da biblioteca, da linha de comando e da interface gráfica, mais
   execuções completas do binário real e do servidor por um socket), entre eles: a atenção é causal,
   a atenção em blocos é igual à do Burn (valores e gradientes), a geração com cache é igual à
   passagem completa, micro-lotes acumulados equivalem a um lote grande, as réplicas dão os
@@ -205,8 +205,17 @@ crates/germen-cli    a linha de comando `germen` (clap)
   BPE. Um bit alterado num arquivo do checkpoint é detectado e o arquivo é nomeado, e um salvamento
   interrompido a qualquer momento é concluído ou descartado. A auditoria adversarial está em
   [docs/AUDIT.md](docs/AUDIT.md).
+* **Verificado com implementações independentes** (0.6) — a rede, o passo do AdamW e o tokenizador BPE
+  foram reescritos em NumPy e Python simples e comparados número a número: os logits, a perda, o
+  gradiente de cada parâmetro (por diferenças finitas) e cinco passos do otimizador coincidem até o
+  arredondamento (erro relativo inferior a 10⁻⁴), e cada fusão do tokenizador é idêntica. Com a
+  receita Shakespeare ao nível do caractere do README do nanoGPT, um modelo `nano` chega a cerca de
+  1,72 nat por byte, contra os 1,88 que o nanoGPT documenta (as receitas diferem: veja a parte IV de
+  [docs/AUDIT.md](docs/AUDIT.md)). O decaimento dos pesos atinge só as matrizes, e um treino parado e
+  retomado é idêntico a um sem interrupção. A velocidade frente a outros frameworks e os modelos
+  maiores frente à referência de GPU do nanoGPT não foram comparados.
 
-## Limites (versão 0.5)
+## Limites (versão 0.6)
 
 * As somas de verificação protegem contra acidentes (um bit alterado, um arquivo truncado, arquivos
   de dois salvamentos diferentes), não contra quem também possa editar o `meta.json`; checkpoints

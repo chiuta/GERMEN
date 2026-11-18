@@ -6,7 +6,7 @@ Thank you for looking! Small, focused contributions are the easiest to review.
 
 ```bash
 cargo build --release
-cargo test --release --workspace      # 70 tests, a few seconds in release mode
+cargo test --release --workspace      # 251 tests, about a minute in release mode
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all
 ```
