@@ -264,6 +264,10 @@ computed and nothing is sent anywhere. It is for looking at the Studio, taking i
 showing it to someone who has not installed anything. (Its script differs from the program's by one
 part, `70-demo.js`; a test checks that the program's own page does not contain it.)
 
+The same file is published as `demo.html` at the root of the repository (GitHub Pages serves it at
+`germen.chiuta.ro/demo.html`, next to the presentation page `index.html`); regenerate it with the command
+above and commit it after any change to the Studio's page.
+
 To record it again — after a change to what training reports, say — start a Studio on an empty
 workspace and run the recorder, which drives the real server over its own interface and rewrites
 the block between `RECORDING:BEGIN` and `RECORDING:END` in `assets/js/70-demo.js`:

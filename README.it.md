@@ -8,6 +8,8 @@ niente telemetria. Un solo eseguibile, un file di testo, un comando. Costruito s
 
 > Lingue: [English](README.md) · [Română](README.ro.md) · [Français](README.fr.md) · **Italiano** · [Español](README.es.md) · [Português](README.pt.md) · [Deutsch](README.de.md) · [Magyar](README.hu.md)
 
+🌐 **Sito:** <https://germen.chiuta.ro> · [demo di Studio online](https://germen.chiuta.ro/demo.html)
+
 ## Che cos'è — e che cosa non è
 
 GERMEN addestra una rete di tipo GPT (RMSNorm, posizioni rotatorie, strato feed-forward con ReLU al

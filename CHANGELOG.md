@@ -4,6 +4,12 @@ All notable changes to GERMEN are listed here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+- A presentation page in the eight languages of the project (`index.html`, one self-contained file with no
+  external request, built around a real recording of a training run) and the Studio's demonstration page
+  (`demo.html`), both served by GitHub Pages at `germen.chiuta.ro`. No change to the program.
+
 ## [0.5.0] — 2026-11-18
 
 **GERMEN Studio**: a graphical interface, `germen ui`. A window in which you choose a text, press

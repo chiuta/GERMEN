@@ -8,6 +8,8 @@ backendul său de procesor `flex`, scris integral în Rust.
 
 > Limbi: [English](README.md) · **Română** · [Français](README.fr.md) · [Italiano](README.it.md) · [Español](README.es.md) · [Português](README.pt.md) · [Deutsch](README.de.md) · [Magyar](README.hu.md)
 
+🌐 **Site:** <https://germen.chiuta.ro> · [demo Studio live](https://germen.chiuta.ro/demo.html)
+
 ## Ce este — și ce nu este
 
 GERMEN antrenează o rețea de tip GPT (RMSNorm, poziții rotative, rețea feed-forward cu ReLU pătrat,

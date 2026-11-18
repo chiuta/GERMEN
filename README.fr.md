@@ -8,6 +8,8 @@ pas de télémétrie. Un seul exécutable, un fichier texte, une commande. Const
 
 > Langues : [English](README.md) · [Română](README.ro.md) · **Français** · [Italiano](README.it.md) · [Español](README.es.md) · [Português](README.pt.md) · [Deutsch](README.de.md) · [Magyar](README.hu.md)
 
+🌐 **Site :** <https://germen.chiuta.ro> · [démo de Studio en ligne](https://germen.chiuta.ro/demo.html)
+
 ## Ce que c'est — et ce que ce n'est pas
 
 GERMEN entraîne un réseau de type GPT (RMSNorm, positions rotatives, couche feed-forward avec ReLU

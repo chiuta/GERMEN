@@ -8,6 +8,8 @@ nincs telemetria. Egyetlen futtatható fájl, egy szövegfájl, egy parancs. A [
 
 > Nyelvek: [English](README.md) · [Română](README.ro.md) · [Français](README.fr.md) · [Italiano](README.it.md) · [Español](README.es.md) · [Português](README.pt.md) · [Deutsch](README.de.md) · **Magyar**
 
+🌐 **Weboldal:** <https://germen.chiuta.ro> · [Studio-bemutató online](https://germen.chiuta.ro/demo.html)
+
 ## Mi ez – és mi nem
 
 A GERMEN egy GPT-típusú hálót tanít (RMSNorm, forgó pozíciókódolás, négyzetre emelt ReLU-t használó

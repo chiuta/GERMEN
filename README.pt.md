@@ -8,6 +8,8 @@ Sem Python, sem CUDA, sem toolchain de C ou C++, sem conta, sem acesso à rede, 
 
 > Idiomas: [English](README.md) · [Română](README.ro.md) · [Français](README.fr.md) · [Italiano](README.it.md) · [Español](README.es.md) · **Português** · [Deutsch](README.de.md) · [Magyar](README.hu.md)
 
+🌐 **Site:** <https://germen.chiuta.ro> · [demo do Studio online](https://germen.chiuta.ro/demo.html)
+
 ## O que é — e o que não é
 
 O GERMEN treina uma rede do tipo GPT (RMSNorm, posições rotativas, camada feed-forward com ReLU ao

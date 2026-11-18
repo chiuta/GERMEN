@@ -8,6 +8,8 @@ telemetría. Un solo ejecutable, un archivo de texto, un comando. Construido sob
 
 > Idiomas: [English](README.md) · [Română](README.ro.md) · [Français](README.fr.md) · [Italiano](README.it.md) · **Español** · [Português](README.pt.md) · [Deutsch](README.de.md) · [Magyar](README.hu.md)
 
+🌐 **Sitio web:** <https://germen.chiuta.ro> · [demo de Studio en línea](https://germen.chiuta.ro/demo.html)
+
 ## Qué es — y qué no es
 
 GERMEN entrena una red de tipo GPT (RMSNorm, posiciones rotatorias, capa feed-forward con ReLU al

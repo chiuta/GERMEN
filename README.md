@@ -8,6 +8,8 @@ One binary, one text file, one command. Built on [Burn](https://burn.dev) 0.22 w
 
 > Languages: **English** · [Română](README.ro.md) · [Français](README.fr.md) · [Italiano](README.it.md) · [Español](README.es.md) · [Português](README.pt.md) · [Deutsch](README.de.md) · [Magyar](README.hu.md)
 
+🌐 **Website:** <https://germen.chiuta.ro> · [live Studio demo](https://germen.chiuta.ro/demo.html)
+
 ## What it is — and what it is not
 
 GERMEN trains a GPT-style network (RMSNorm, rotary positions, squared-ReLU feed-forward, no biases)
