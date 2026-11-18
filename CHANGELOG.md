@@ -9,6 +9,8 @@ All notable changes to GERMEN are listed here. The format follows
 - A presentation page in the eight languages of the project (`index.html`, one self-contained file with no
   external request, built around a real recording of a training run) and the Studio's demonstration page
   (`demo.html`), both served by GitHub Pages at `germen.chiuta.ro`. No change to the program.
+- A manual workflow, *tag a release* (Actions → Run workflow), that creates the tag `v<version>` and starts
+  the release build (draft pre-release and binaries); CI can now also be started by hand.
 
 ## [0.5.0] — 2026-11-18
 

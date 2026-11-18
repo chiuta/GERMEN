@@ -5,6 +5,8 @@ on:
     branches: [main]
     tags: ["v*"]
   pull_request:
+  # Started by the "tag a release" workflow, which cannot trigger a tag push by itself.
+  workflow_dispatch:
 
 permissions:
   contents: read
