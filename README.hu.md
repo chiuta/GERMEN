@@ -56,6 +56,27 @@ visszaáll, így a tanítás a hidegindítás okozta veszteségugrás nélkül f
 Ugyanaz a `train` parancs `--resume` *nélkül* újra kiadva elutasításra kerül, hogy ne írjon felül
 véletlenül egy betanított modellt; az `--overwrite` megengedi, ha tényleg elölről akarod kezdeni.
 
+## Az ablak: GERMEN Studio
+
+Inkább ablakot szeretnél parancssor helyett?
+
+```bash
+germen ui
+```
+
+megnyitja a **GERMEN Studio**t: válassz egy szöveget, nyomd meg a **Tanítás indítása** gombot, és
+nézd, ahogy a modell tanul – a veszteséggörbét, a sebességet és mintákat arról, amit a hálózat ír,
+miközben javul. Ugyanez az ablak szöveget ír a modelljeidből, ellenőrzi és javítja a fájljaikat, és
+megméri a géped sebességét, ugyanazzal a kóddal, mint a fenti parancsok. Nyolc nyelven érhető el,
+világos és sötét változatban, elfér egy telefonméretű ablakban és egy széles képernyőn is, és úgy
+készült, hogy billentyűzettel és képernyőolvasóval is használható legyen.
+
+Egyetlen kis szerver, amely csak a `127.0.0.1` címen figyel, és egy oldal, amelyet kiszolgál: nincs
+mit telepíteni, nincs mit letölteni, és semmi sem megy sehová. A kiírt cím egy csak erre a futásra
+érvényes titkot tartalmaz, így csak a vele megnyitott ablak (vagy te) adhat neki parancsot. A
+modellek és a szövegek a `~/GERMEN` mappában vannak (a `--workspace` ezt változtatja meg); a
+`--no-open` csak kiírja a címet. Hogyan védett, és minden más: [docs/STUDIO.md](docs/STUDIO.md).
+
 ## Parancsok
 
 | parancs | mit csinál |
@@ -66,6 +87,7 @@ véletlenül egy betanított modellt; az `--overwrite` megengedi, ha tényleg el
 | `germen train` | a nulláról tanít (`--data FÁJL` vagy `--demo`), vagy a `--resume` kapcsolóval folytatja |
 | `germen generate` | szöveget generál egy betanított modellből, kulcs–érték gyorsítótárral (`--temperature`, `--top-k`, `--prompt`) |
 | `germen verify` | ellenőriz egy ellenőrzőpontot: minden fájl méretét és SHA-256 összegét a `meta.json` alapján (amit a `sha256sum` kiír); a `--recover` befejez egy megszakadt mentést, szöveg nélkül |
+| `germen ui` | megnyitja a GERMEN Studiót, a grafikus felületet: egy csak a `127.0.0.1` címen figyelő szerver és egy saját ablak (`--workspace`, `--port`, `--no-open`); lásd a [docs/STUDIO.md](docs/STUDIO.md) fájlt |
 
 Érdemes ismerni ezeket a tanítási kapcsolókat: `--tokenizer byte|bpe` és `--vocab N` (a BPE mérete);
 `--batch` és `--accum` (gradiens-felhalmozás: a tényleges köteg a kettő szorzata, a memória csak a
@@ -126,6 +148,7 @@ A generálás kulcs–érték gyorsítótárat használ: 400 token a `mini` mode
 ```
 crates/germen-core   a könyvtár: config, model, tokenizer, bpe, data, train, gradients,
                      generate, checkpoint, bench
+crates/germen-studio GERMEN Studio: a `germen ui` mögötti szerver és oldal (csak a szabványos könyvtár)
 crates/germen-cli    a `germen` parancssor (clap)
 ```
 
@@ -160,18 +183,27 @@ crates/germen-cli    a `germen` parancssor (clap)
   által írt ellenőrzőpontok továbbra is betölthetők. A 0.4 óta a `meta.json` a többi fájl méretét és
   SHA-256 összegét is rögzíti, minden betöltéskor ellenőrizve: a sérült, csonka vagy másik mentésből
   való fájlt a hibaüzenet néven nevezi; a régebbiek ellenőrzés nélkül töltődnek be.
-* **Tesztek** — 156 teszt (a könyvtár és a parancssor egységtesztjei, valamint a valódi bináris
-  teljes futtatásai), köztük: a figyelem oksági, a blokkos figyelem megegyezik a Burnéval (értékek
-  és gradiensek), a gyorsítótáras generálás megegyezik a teljes átfutással, a felhalmozott
-  mikro-kötegek egyenértékűek egy nagy köteggel, a replikák egyetlen nagy gráf gradienseit adják és
-  egy futás bitre pontosan reprodukálható, egy optimalizálási lépés az AdamW állapotának újratöltése
-  után megegyezik a megszakítatlan tanítás lépésével, egy ellenőrzőpont sosem marad félig megírva és
-  nem véges súlyokat sosem mentünk, az ellenséges tokenizer- és konfigurációs fájlok elutasításra
-  kerülnek, minden bájtsorozat átvészeli az oda-vissza utat a BPE-n. Egy ellenőrzőpont-fájlban
-  megbillent bitet észrevesz és megnevezi a fájlt, a bármikor megszakadt mentést pedig befejezi vagy
-  eldobja. Az ellenséges szemléletű auditról a [docs/AUDIT.md](docs/AUDIT.md) szól.
+* **Studio** — a `germen ui` elindít egy kis HTTP-szervert, amely csak a szabványos könyvtárral
+  készült és a `127.0.0.1` címhez kötött, és kiszolgál egy önálló oldalt (benne a stílus, a
+  szkript és a nyolc nyelv; nem tölt be semmit). Az oldal ugyanazt a tanító, generáló és mérő kódot
+  indítja el, mint a parancssor, és eseményeken át követi. Ki beszélhet a szerverrel: egy titok a
+  címben (a `#` után, amelyet a böngésző sosem küld el), a `Host` és az `Origin` fejléc, valamint
+  egy Content-Security-Policy, amely pontosan egy szkriptet enged futni; ezeket a kapukat valódi
+  socketen át támadó tesztek vizsgálják, és sorra kikapcsolja 18 mutációs bizonyíték, amelyet a
+  teszteknek észre kell venniük ([docs/STUDIO.md](docs/STUDIO.md)).
+* **Tesztek** — 247 teszt (a könyvtár, a parancssor és a grafikus felület egységtesztjei, valamint a
+  valódi bináris és a szerver teljes futtatásai egy socketen át), köztük: a figyelem oksági, a
+  blokkos figyelem megegyezik a Burnéval (értékek és gradiensek), a gyorsítótáras generálás
+  megegyezik a teljes átfutással, a felhalmozott mikro-kötegek egyenértékűek egy nagy köteggel, a
+  replikák egyetlen nagy gráf gradienseit adják és egy futás bitre pontosan reprodukálható, egy
+  optimalizálási lépés az AdamW állapotának újratöltése után megegyezik a megszakítatlan tanítás
+  lépésével, egy ellenőrzőpont sosem marad félig megírva és nem véges súlyokat sosem mentünk, az
+  ellenséges tokenizer- és konfigurációs fájlok elutasításra kerülnek, minden bájtsorozat átvészeli
+  az oda-vissza utat a BPE-n. Egy ellenőrzőpont-fájlban megbillent bitet észrevesz és megnevezi a
+  fájlt, a bármikor megszakadt mentést pedig befejezi vagy eldobja. Az ellenséges szemléletű
+  auditról a [docs/AUDIT.md](docs/AUDIT.md) szól.
 
-## Korlátok (0.4-es verzió)
+## Korlátok (0.5-ös verzió)
 
 * Az ellenőrző összegek a balesetek ellen védenek (megbillent bit, csonka fájl, két különböző mentés
   fájljai), nem az ellen, aki a `meta.json`-t is át tudja írni; a 0.4 előtt írt ellenőrzőpontok nem
@@ -184,10 +216,13 @@ crates/germen-cli    a `germen` parancssor (clap)
 * Nincs vegyes pontosság és nincs GPU-háttérrendszer.
 * A `demo` korpusz szintetikus és parányi: azt bizonyítja, hogy a lánc tanul, többet nem.
 * Még nincs lemérve Windowson, macOS-en vagy sok magos gépen – fent leírtuk, hogyan segíthetsz.
+* A GERMEN Studiót valódi böngészőben csak Linuxon és csak Chromiumban próbálták ki; Windowson és
+  macOS-en a tesztjei átmennek a CI-ben, de az ablakát ott még senki nem használta, és
+  képernyőolvasóval sem használta még senki.
 
-Lásd a [CHANGELOG.md](CHANGELOG.md), a [docs/PLAN.md](docs/PLAN.md) és a
-[docs/AUDIT.md](docs/AUDIT.md) fájlt. A hozzájárulásokat szívesen fogadjuk
-([CONTRIBUTING.md](CONTRIBUTING.md)).
+Lásd a [CHANGELOG.md](CHANGELOG.md), a [docs/PLAN.md](docs/PLAN.md), a
+[docs/AUDIT.md](docs/AUDIT.md) és a [docs/STUDIO.md](docs/STUDIO.md) fájlt. A hozzájárulásokat
+szívesen fogadjuk ([CONTRIBUTING.md](CONTRIBUTING.md)).
 
 ## Licenc
 

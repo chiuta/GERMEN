@@ -4,6 +4,62 @@ All notable changes to GERMEN are listed here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [0.5.0] — 2026-11-18
+
+**GERMEN Studio**: a graphical interface, `germen ui`. A window in which you choose a text, press
+a button and watch a model learn; the same window writes text, checks and repairs models and
+measures the speed of the computer. It is built on the standard library alone (a small web server
+on `127.0.0.1` and one self-contained page), so the workspace gained no dependency, and the
+command line is unchanged. Details, the threat model and the interface of the server are in
+[docs/STUDIO.md](docs/STUDIO.md); the review of it is Part III of [docs/AUDIT.md](docs/AUDIT.md).
+
+### Added
+- **`germen ui`** (`--workspace`, `--port`, `--no-open`, `--max-upload-mb`): starts the Studio and
+  opens it as an application window where Chrome, Edge, Chromium or Brave is installed, otherwise in
+  the default browser. Closing the window (or Ctrl-C) saves a running training first.
+  - **Train**: a text from disk or dropped on the page, a model size, the tokenizer and every
+    option of `germen train`, a live estimate of memory and time, then the loss (training and
+    checking text; linear or logarithmic), the learning rate, the speed, the gradient norm and the
+    samples as they are written; reload or open a second window in the middle of a run and it is
+    picked up again; stop; continue; replace on purpose.
+  - **Models**: what is in the workspace or in any folder, **Check files** (`verify`) and
+    **Repair** (`verify --recover`).
+  - **Write**: text from a model as it is produced, copy, continue; usable while a model trains.
+  - **Speed**: `bench` for every size or one, and the thread sweep as a chart (the ideal line, the
+    speed-up, the efficiency).
+  - **Settings** and **About**: eight languages (English, Romanian, French, Italian, Spanish,
+    Portuguese, German, Hungarian), light, dark, more contrast, less motion, density, text size, an
+    icons-only side bar, a notification and a sound when a training ends.
+  - Keyboard use, screen readers, phone-sized windows (320 px) and forced colours were designed
+    for; the pages pass the axe-core rules, were swept in Chromium at five widths in all eight
+    languages and looked at in an emulation of forced colours (STUDIO.md §6 and §9 say what that
+    shows and what it does not).
+- **Safety of the server**: loopback only; a secret in the address (after the `#`, so it is never
+  sent to a server), the `Host`, `Origin` and `Sec-Fetch-Site` headers checked, a
+  Content-Security-Policy that lets exactly one inline script and one inline style run (named by
+  their SHA-256) plus Trusted Types, names from the network resolved in one module, every limit
+  checked before the data it guards is read. `docs/STUDIO.md` §4 says what it does not defend against.
+- **A demonstration page**: `germen ui --write-demo FILE` (a hidden option) writes one HTML file
+  of about 440 KiB that replays a real recorded training, a text it wrote and a speed measurement
+  through the same page, with no program behind it. `scripts/record_demo.py` records it again.
+- In the library: `Bpe::train_cancellable` (learning a vocabulary can be stopped),
+  `generate::generate_until` (so can writing) and `data::sample_blocks` (moved from the command line).
+- **91 new tests**, 247 in all: 60 unit and 21 integration tests of the Studio (the integration tests
+  attack a real server over a socket), 2 of the command (`germen ui` is started and closed as a user
+  would, on Ubuntu, Windows and macOS in CI) and 7 of the library. And **18 mutation proofs**
+  (`python3 scripts/audit_mutations.py T-`): each gate of the server is switched off in turn and a
+  test must fail; the first run found that one proof was bound to the wrong test, none that a gate
+  was unguarded.
+
+### Fixed
+- `germen ui --max-upload-mb` accepted values above the documented range (1 … 1,000,000) and
+  started the server (C-01 in AUDIT.md; found by the new test of the command).
+
+### Changed
+- `docs/PLAN.md`: the graphical interface the plan called "egui" is a local web page instead, and
+  why (decision table); the roadmap moves memory-mapped corpora and safetensors to 0.6.
+- The version is 0.5.0. Checkpoints are unchanged: 0.4 and 0.5 read each other's.
+
 ## [0.4.0] — 2026-11-17
 
 A second adversarial audit, of 0.3.0, aimed at the places where a damaged, mixed-up or half-written

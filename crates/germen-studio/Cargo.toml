@@ -1,0 +1,14 @@
+[package]
+name = "germen-studio"
+description = "GERMEN Studio: interfață grafică locală (server pe 127.0.0.1 și pagină încorporată)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+germen-core = { path = "../germen-core" }
+serde = { workspace = true }
+serde_json = { workspace = true }

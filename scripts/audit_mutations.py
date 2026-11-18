@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Mutation proofs for docs/AUDIT.md (round 2).
+"""Mutation proofs for docs/AUDIT.md (round 2, and the Studio of 0.5.0: entries T-xx).
 
 For each entry one defect is put back (or one line of the fast SHA-256 is broken), the tests that
 are meant to guard against it are run, and at least one of them must FAIL; the file is restored
@@ -7,6 +7,7 @@ afterwards and the build must work again.
 
     python3 scripts/audit_mutations.py            # all of them (about 10 minutes)
     python3 scripts/audit_mutations.py B-07 S-    # only the entries whose name starts so
+    python3 scripts/audit_mutations.py T-         # only the Studio's (about 6 minutes)
 
 The sources are edited in place and restored in a `finally`; do not run other builds meanwhile.
 """
@@ -141,6 +142,67 @@ mut("S-05 SHA-NI: the bytes of a message word are not fully reversed",
 mut("S-06 the fast backend is never chosen (the dispatch test must notice)",
     INTEGRITY, '&& std::arch::is_x86_feature_detected!("sse4.1")\n        {', '&& std::arch::is_x86_feature_detected!("sse4.1")\n            && false\n        {',
     CORE + "the_fast_backend_is_chosen")
+
+# --- GERMEN Studio (0.5.0): who may talk to the server, and what it may make it do.
+# Every gate is switched off in turn; the tests that attack that gate must notice.
+STUDIO = "cargo test --release --locked -p germen-studio "
+API = "crates/germen-studio/src/api.rs"
+AUTH = "crates/germen-studio/src/auth.rs"
+mut("T-01 the Host header is no longer checked (DNS rebinding gets in)",
+    API, ".is_some_and(|host| auth::host_allowed(host, shared.port))", ".is_some_and(|host| !host.is_empty())",
+    STUDIO + "--test http a_request_meant_for_another_host")
+mut("T-02 the Origin header is no longer checked (another page's request gets in)",
+    API, "&& !auth::origin_allowed(origin, shared.port)", "&& false",
+    STUDIO + "--test http requests_that_another_page_made")
+mut("T-03 Sec-Fetch-Site is no longer checked",
+    API, "&& !auth::fetch_site_allowed(site)", "&& false",
+    STUDIO + "--test http requests_that_another_page_made")
+mut("T-04 the token is no longer required",
+    API, "    if !allowed {", "    if false && !allowed {",
+    STUDIO + "--test http the_api_needs_the_token")
+mut("T-05 any token is accepted",
+    API, ".is_some_and(|t| auth::constant_time_eq(t.as_bytes(), shared.token.as_bytes()));", ".is_some_and(|t| !t.is_empty());",
+    STUDIO + "--test http the_api_needs_the_token")
+mut("T-06 the comparison of tokens accepts a prefix of the real one",
+    AUTH, "    let mut difference = a.len() ^ b.len();\n    for i in 0..a.len().max(b.len()) {", "    let mut difference = 0usize;\n    for i in 0..a.len().min(b.len()) {",
+    STUDIO + "--lib auth::")
+mut("T-07 the policy lets inline script run (its hash is replaced by 'unsafe-inline')",
+    "crates/germen-studio/src/page.rs", "csp_hash(&script),", "\"'unsafe-inline'\",",
+    STUDIO + "the_page_is_served_with_a_policy")
+mut("T-08 the policy no longer asks for Trusted Types",
+    "crates/germen-studio/src/page.rs", "object-src 'none'; require-trusted-types-for 'script'\"", "object-src 'none'\"",
+    STUDIO + "page::")
+mut("T-09 a model name may contain a slash (a way out of the workspace)",
+    "crates/germen-studio/src/workspace.rs", "matches!(c, b'-' | b'_' | b'.'))", "matches!(c, b'-' | b'_' | b'.' | b'/'))",
+    STUDIO + "names_from_the_network")
+mut("T-10 an upload may be larger than the limit",
+    API, "    if length > shared.max_upload {", "    if false && length > shared.max_upload {",
+    STUDIO + "--test http a_text_can_be_uploaded_within_the_limit")
+mut("T-11 an upload may replace a file that is there",
+    "crates/germen-studio/src/workspace.rs", ".write(true).create_new(true).open(&path)", ".write(true).create(true).truncate(true).open(&path)",
+    STUDIO + "--test http a_text_can_be_uploaded_within_the_limit")
+mut("T-12 a second Host header is merged instead of refused (request smuggling)",
+    "crates/germen-studio/src/http.rs", 'const SINGLE: [&str; 9] = [\n    "host",\n', 'const SINGLE: [&str; 9] = [\n    "x-host",\n',
+    STUDIO + "malformed_requests")
+mut("T-13 the number of connections is not limited",
+    "crates/germen-studio/src/lib.rs", "const MAX_CONNECTIONS: usize = 64;", "const MAX_CONNECTIONS: usize = 100_000;",
+    STUDIO + "--test http too_many_connections")
+mut("T-14 a JSON body may be of any size",
+    API, "pub(crate) const MAX_JSON_BODY: u64 = 1 << 20;", "pub(crate) const MAX_JSON_BODY: u64 = 1 << 40;",
+    STUDIO + "--test http malformed_requests")
+mut("T-15 the server listens on every interface, not on 127.0.0.1 alone",
+    "crates/germen-studio/src/lib.rs", "TcpListener::bind((Ipv4Addr::LOCALHOST, p))", "TcpListener::bind((Ipv4Addr::UNSPECIFIED, p))",
+    STUDIO + "--lib loopback_only")
+mut("T-16 a model that is being trained can be checked (read half-written) from outside",
+    API, "            if hub.dir_in_training(&dir) {\n                return Err(model_busy(&dir));\n            }\n            Ok(Response::ok(&work::verify_model(&dir, shared.threads)?))",
+    "            Ok(Response::ok(&work::verify_model(&dir, shared.threads)?))",
+    STUDIO + "--test http a_model_in_training_is_not_touched")
+mut("T-17 a fresh training over a trained model is accepted",
+    API, "Mode::New if checkpoint::exists(&dir) => {", "Mode::New if false && checkpoint::exists(&dir) => {",
+    STUDIO + "--test http a_model_is_trained_from_scratch")
+mut("T-18 the page's Close does not close the server",
+    API, "            shared.request_shutdown();\n            Ok(Response::ok(&json!({ \"ok\": true })))", "            Ok(Response::ok(&json!({ \"ok\": true })))",
+    STUDIO + "--test http the_page_can_close_the_server")
 
 only = sys.argv[1:]
 summary = []

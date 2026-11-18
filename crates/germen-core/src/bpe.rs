@@ -15,6 +15,7 @@ use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap};
 use std::hash::{BuildHasherDefault, Hasher};
 use std::ops::Range;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Longest pre-token in bytes; longer runs are cut. Keeps the cost of encoding a word bounded.
 const MAX_PRETOKEN: usize = 64;
@@ -250,6 +251,21 @@ impl Bpe {
         vocab_size: usize,
         progress: &mut dyn FnMut(usize, usize),
     ) -> Result<Bpe, String> {
+        Bpe::train_cancellable(data, vocab_size, progress, &AtomicBool::new(false))
+    }
+
+    /// [`Bpe::train`] that gives up, with an error, shortly after `cancel` becomes `true`
+    /// (a "Stop" button). It looks at the flag while it counts the words of the text and before
+    /// every merge, so even a large sample is left within moments.
+    pub fn train_cancellable(
+        data: &[u8],
+        vocab_size: usize,
+        progress: &mut dyn FnMut(usize, usize),
+        cancel: &AtomicBool,
+    ) -> Result<Bpe, String> {
+        /// How many words are counted between two looks at the flag.
+        const CANCEL_CHECK_EVERY: usize = 1 << 16;
+        let cancelled = || "învățarea vocabularului a fost oprită".to_string();
         if !(257..=MAX_VOCAB).contains(&vocab_size) {
             return Err(format!(
                 "--vocab trebuie să fie între 257 și {MAX_VOCAB} (primit {vocab_size})"
@@ -259,7 +275,10 @@ impl Bpe {
 
         // Count distinct pre-tokens: BPE then works on (word, count) pairs, not on the text.
         let mut counts: FxMap<&[u8], u64> = FxMap::default();
-        for r in PreTokens::new(data) {
+        for (i, r) in PreTokens::new(data).enumerate() {
+            if i % CANCEL_CHECK_EVERY == 0 && cancel.load(Ordering::Relaxed) {
+                return Err(cancelled());
+            }
             if r.len() > 1 {
                 *counts.entry(&data[r]).or_insert(0) += 1;
             }
@@ -289,6 +308,9 @@ impl Bpe {
 
         let mut merges: Vec<(TokenId, TokenId)> = Vec::with_capacity(wanted);
         while merges.len() < wanted {
+            if cancel.load(Ordering::Relaxed) {
+                return Err(cancelled());
+            }
             let Some((count, Reverse(pair))) = heap.pop() else {
                 break;
             };
@@ -713,5 +735,56 @@ mod tests {
             .collect();
         assert_eq!(back, b"aaa");
         assert!(ids.len() <= 2);
+    }
+
+    #[test]
+    fn learning_stops_when_asked_before_it_starts() {
+        let data = demo_corpus(60_000, 2);
+        let cancel = AtomicBool::new(true);
+        let mut calls = 0;
+        let outcome = Bpe::train_cancellable(data.as_bytes(), 400, &mut |_, _| calls += 1, &cancel);
+        assert!(outcome.is_err());
+        assert_eq!(calls, 0, "no merge may have been made");
+    }
+
+    #[test]
+    fn learning_stops_in_the_middle_of_the_merges() {
+        let data = demo_corpus(200_000, 3);
+        let cancel = AtomicBool::new(false);
+        let mut reports = Vec::new();
+        let outcome = Bpe::train_cancellable(
+            data.as_bytes(),
+            1000,
+            &mut |done, _| {
+                reports.push(done);
+                if done >= 32 {
+                    cancel.store(true, Ordering::Relaxed);
+                }
+            },
+            &cancel,
+        );
+        assert!(
+            outcome.is_err(),
+            "a cancelled run must not return a vocabulary"
+        );
+        let last = *reports.last().expect("progress was reported");
+        assert!(
+            (32..=48).contains(&last),
+            "stopped within moments of the request: {last}"
+        );
+    }
+
+    #[test]
+    fn an_unused_cancel_flag_changes_nothing() {
+        let data = demo_corpus(80_000, 5);
+        let plain = Bpe::train(data.as_bytes(), 500, &mut |_, _| {}).unwrap();
+        let guarded = Bpe::train_cancellable(
+            data.as_bytes(),
+            500,
+            &mut |_, _| {},
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert_eq!(plain, guarded);
     }
 }

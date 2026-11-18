@@ -1,6 +1,6 @@
 //! `germen` — command-line front end of GERMEN.
 //!
-//! Subcommands: `info`, `bench`, `demo-corpus`, `train`, `generate`, `verify`.
+//! Subcommands: `info`, `bench`, `demo-corpus`, `train`, `generate`, `verify`, `ui`.
 #![deny(unsafe_code)]
 
 use clap::{Args, Parser, Subcommand};
@@ -10,7 +10,7 @@ use germen_core::bench::{
 use germen_core::bpe::Bpe;
 use germen_core::checkpoint;
 use germen_core::config::{GptConfig, Preset};
-use germen_core::data::{Corpus, Rng, demo_corpus, split_point};
+use germen_core::data::{Corpus, Rng, demo_corpus, sample_blocks, split_point};
 use germen_core::generate::{SampleOptions, generate};
 use germen_core::sys;
 use germen_core::tokenizer::{Tokenizer, Utf8Stream};
@@ -51,6 +51,27 @@ enum Command {
     Generate(GenerateArgs),
     /// Verifică un punct de control: sumele SHA-256 din meta.json, ponderile, optimizatorul
     Verify(VerifyArgs),
+    /// Pornește interfața grafică (GERMEN Studio): un server local, doar pe 127.0.0.1, și o fereastră
+    Ui(UiArgs),
+}
+
+#[derive(Args)]
+struct UiArgs {
+    /// Folderul de lucru, cu modelele, textele și setările (implicit: ~/GERMEN)
+    #[arg(long, value_name = "DIR")]
+    workspace: Option<PathBuf>,
+    /// Portul de pe 127.0.0.1 (implicit: 7870 sau următorul liber)
+    #[arg(long, value_name = "PORT")]
+    port: Option<u16>,
+    /// Nu deschide browserul; doar afișează adresa
+    #[arg(long)]
+    no_open: bool,
+    /// Cel mai mare text pe care pagina îl poate încărca, în MiB (1 … 1000000)
+    #[arg(long, value_name = "MIB", default_value_t = 2048)]
+    max_upload_mb: u64,
+    /// Scrie pagina de demonstrație (un singur fișier HTML, fără server) și iese
+    #[arg(long, value_name = "FILE", hide = true)]
+    write_demo: Option<PathBuf>,
 }
 
 #[derive(Args)]
@@ -243,9 +264,12 @@ fn main() -> ExitCode {
         return ExitCode::from(2);
     }
     let threads_flag_given = cli.threads.is_some();
-    // A thread sweep builds its own pools, so the one it starts from needs a single worker.
+    let requested_threads = cli.threads;
+    // A thread sweep builds its own pools, so the one it starts from needs a single worker; so does
+    // the Studio, whose jobs each build the pool they need.
     let threads = match &cli.command {
         Command::Bench(a) if a.scaling.is_some() => Some(1),
+        Command::Ui(_) => Some(1),
         _ => cli.threads,
     };
     let command = cli.command;
@@ -258,6 +282,7 @@ fn main() -> ExitCode {
         Command::Train(a) => cmd_train(a),
         Command::Generate(a) => cmd_generate(a),
         Command::Verify(a) => cmd_verify(a),
+        Command::Ui(a) => cmd_ui(a, requested_threads),
     })
     .and_then(|r| r);
     match result {
@@ -267,6 +292,62 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// The largest value of `germen ui --max-upload-mb` (about a tebibyte: more is no limit at all).
+const MAX_UPLOAD_MB: u64 = 1_000_000;
+
+/// `germen ui`: the graphical interface. Runs until the window asks to close or Ctrl-C.
+fn cmd_ui(a: UiArgs, threads: Option<usize>) -> Result<(), String> {
+    if let Some(file) = &a.write_demo {
+        std::fs::write(file, germen_studio::demo_page())
+            .map_err(|e| format!("nu pot scrie {}: {e}", file.display()))?;
+        println!("Pagina de demonstrație: {}", file.display());
+        return Ok(());
+    }
+    let mut options = germen_studio::Options::default();
+    if let Some(workspace) = a.workspace {
+        options.workspace = workspace;
+    }
+    options.port = a.port;
+    options.threads = threads;
+    options.max_upload = Some(a.max_upload_mb)
+        .filter(|mb| (1..=MAX_UPLOAD_MB).contains(mb))
+        .map(|mb| mb * 1024 * 1024)
+        .ok_or_else(|| format!("--max-upload-mb: o valoare între 1 și {MAX_UPLOAD_MB}"))?;
+    let studio = germen_studio::Studio::start(options)?;
+    let url = studio.url();
+    println!("GERMEN Studio rulează.");
+    println!("  Adresa:  {url}");
+    println!("  Folder:  {}", studio.workspace().display());
+    println!(
+        "  Oprire:  Ctrl-C, sau „Închide” din fereastră (o antrenare în curs se salvează întâi)"
+    );
+    println!("  Adresa e secretă: cine o are poate porni lucrări pe acest calculator.");
+
+    let handle = studio.shutdown_handle();
+    let closing = Arc::new(AtomicBool::new(false));
+    let _ = ctrlc::set_handler(move || {
+        if closing.swap(true, Ordering::SeqCst) {
+            std::process::exit(130);
+        }
+        eprintln!(
+            "\nMă închid; o antrenare în curs se salvează întâi (încă un Ctrl-C = ieșire imediată)..."
+        );
+        handle.request();
+    });
+    if !a.no_open {
+        match germen_studio::browser::open(&url) {
+            Ok(germen_studio::browser::Opened::AppWindow) => {}
+            Ok(germen_studio::browser::Opened::DefaultBrowser) => {
+                println!("  Deschis în browserul implicit.");
+            }
+            Err(e) => println!("  {e}; deschide adresa de mai sus într-un browser."),
+        }
+    }
+    studio.serve();
+    println!("GERMEN Studio s-a închis.");
+    Ok(())
 }
 
 /// Said when a checkpoint has no manifest of SHA-256 sums to be checked against.
@@ -464,23 +545,6 @@ fn cmd_demo(a: DemoArgs) -> Result<(), String> {
         println!("  {line}");
     }
     Ok(())
-}
-
-/// Up to `budget` bytes of `data`, taken as evenly spaced 1 MiB blocks so that a very large
-/// corpus is represented by all of its parts, not only by its beginning.
-fn sample_blocks(data: &[u8], budget: usize) -> Vec<u8> {
-    const BLOCK: usize = 1 << 20;
-    if data.len() <= budget {
-        return data.to_vec();
-    }
-    let blocks = (budget / BLOCK).max(1);
-    let stride = data.len() / blocks;
-    let mut out = Vec::with_capacity(blocks * BLOCK);
-    for i in 0..blocks {
-        let start = i * stride;
-        out.extend_from_slice(&data[start..(start + BLOCK).min(data.len())]);
-    }
-    out
 }
 
 fn cmd_train(a: TrainArgs) -> Result<(), String> {

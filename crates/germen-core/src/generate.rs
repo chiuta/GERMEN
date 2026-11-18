@@ -116,6 +116,34 @@ pub fn generate(
     opts: &SampleOptions,
     rng: &mut Rng,
     device: &Device,
+    on_token: impl FnMut(TokenId),
+) -> Vec<TokenId> {
+    generate_until(
+        model,
+        tokenizer,
+        prompt,
+        opts,
+        rng,
+        device,
+        || false,
+        on_token,
+    )
+}
+
+/// [`generate`] that asks `stop` before every new token and ends the run, with the tokens made so
+/// far, as soon as it answers `true` (a "Stop" button; Ctrl-C).
+///
+/// The first answer is asked after the prompt has been read, so a very long prompt is not
+/// interrupted half-way through; with `max_new == 0` nothing is asked at all.
+#[allow(clippy::too_many_arguments)]
+pub fn generate_until(
+    model: &Gpt,
+    tokenizer: &Tokenizer,
+    prompt: &[u8],
+    opts: &SampleOptions,
+    rng: &mut Rng,
+    device: &Device,
+    mut stop: impl FnMut() -> bool,
     mut on_token: impl FnMut(TokenId),
 ) -> Vec<TokenId> {
     let mut context: Vec<TokenId> =
@@ -132,6 +160,9 @@ pub fn generate(
     let from = context.len().saturating_sub(window);
     let mut logits = next_logits(model, &context[from..], &mut cache, device);
     for i in 0..opts.max_new {
+        if stop() {
+            break;
+        }
         let next = sample_logits(&logits, opts.temperature, opts.top_k, rng);
         context.push(next);
         out.push(next);
@@ -225,6 +256,95 @@ mod tests {
             );
             assert_eq!(produced, 5, "max_new = {max_new}");
         }
+    }
+
+    #[test]
+    fn generation_ends_as_soon_as_stop_says_so() {
+        let device = Device::flex();
+        let model = Preset::Nano.config(16).init_seeded(&device, 1);
+        let opts = SampleOptions {
+            max_new: 50,
+            temperature: 1.0,
+            top_k: 0,
+            window: 8,
+        };
+        for allowed in [0usize, 1, 7, 49] {
+            let mut asked = 0;
+            let mut streamed = Vec::new();
+            let out = generate_until(
+                &model,
+                &Tokenizer::Byte,
+                b"Ana",
+                &opts,
+                &mut Rng::new(3),
+                &device,
+                || {
+                    asked += 1;
+                    asked > allowed
+                },
+                |t| streamed.push(t),
+            );
+            assert_eq!(out.len(), allowed, "allowed = {allowed}");
+            assert_eq!(out, streamed);
+            assert_eq!(
+                asked,
+                allowed + 1,
+                "asked once before every token, and once more"
+            );
+        }
+    }
+
+    #[test]
+    fn a_stop_that_never_fires_changes_nothing() {
+        let device = Device::flex();
+        let model = Preset::Nano.config(16).init_seeded(&device, 1);
+        let opts = SampleOptions {
+            max_new: 30,
+            temperature: 0.9,
+            top_k: 20,
+            window: 8,
+        };
+        let plain = generate(
+            &model,
+            &Tokenizer::Byte,
+            b"Era o dat\xc4\x83",
+            &opts,
+            &mut Rng::new(11),
+            &device,
+            |_| {},
+        );
+        let guarded = generate_until(
+            &model,
+            &Tokenizer::Byte,
+            b"Era o dat\xc4\x83",
+            &opts,
+            &mut Rng::new(11),
+            &device,
+            || false,
+            |_| {},
+        );
+        assert_eq!(plain, guarded);
+    }
+
+    #[test]
+    fn nothing_is_asked_when_nothing_is_to_be_made() {
+        let device = Device::flex();
+        let model = Preset::Nano.config(16).init_seeded(&device, 1);
+        let opts = SampleOptions {
+            max_new: 0,
+            ..SampleOptions::default()
+        };
+        let out = generate_until(
+            &model,
+            &Tokenizer::Byte,
+            b"x",
+            &opts,
+            &mut Rng::new(1),
+            &device,
+            || panic!("stop must not be asked when max_new is 0"),
+            |_| {},
+        );
+        assert!(out.is_empty());
     }
 
     #[test]

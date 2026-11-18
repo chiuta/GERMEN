@@ -450,3 +450,228 @@ fn a_save_cut_off_between_two_renames_is_refused_with_a_remedy_and_completed_by_
         let _ = std::fs::remove_dir_all(dir);
     }
 }
+
+// ---- `germen ui`: the graphical interface, started and closed as a user would ----
+
+/// One answer of the Studio, read to the end of the connection (it closes after every answer).
+struct Reply {
+    status: u16,
+    headers: Vec<(String, String)>,
+    body: Vec<u8>,
+}
+
+impl Reply {
+    fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(key, _)| key == name)
+            .map(|(_, value)| value.as_str())
+    }
+}
+
+/// One HTTP/1.1 request over a plain socket: `host` is what the `Host` header says, `token` the
+/// bearer token (none: no `Authorization` header).
+fn ask(port: u16, method: &str, path: &str, host: &str, token: Option<&str>) -> Reply {
+    use std::io::{Read, Write};
+    let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).expect("the Studio listens");
+    stream
+        .set_read_timeout(Some(std::time::Duration::from_secs(30)))
+        .unwrap();
+    let mut request = format!("{method} {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n");
+    if let Some(token) = token {
+        request.push_str(&format!("Authorization: Bearer {token}\r\n"));
+    }
+    if method == "POST" {
+        request.push_str("Content-Length: 0\r\n");
+    }
+    request.push_str("\r\n");
+    stream.write_all(request.as_bytes()).unwrap();
+    let mut raw = Vec::new();
+    stream
+        .read_to_end(&mut raw)
+        .expect("the Studio answers and closes the connection");
+    let split = raw
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .expect("a complete head");
+    let head = String::from_utf8_lossy(&raw[..split]).into_owned();
+    let mut lines = head.split("\r\n");
+    let status = lines
+        .next()
+        .and_then(|line| line.split(' ').nth(1))
+        .and_then(|code| code.parse().ok())
+        .expect("a status line");
+    let headers = lines
+        .filter_map(|line| line.split_once(':'))
+        .map(|(key, value)| (key.trim().to_ascii_lowercase(), value.trim().to_string()))
+        .collect();
+    Reply {
+        status,
+        headers,
+        body: raw[split + 4..].to_vec(),
+    }
+}
+
+/// Kills the child when the test ends any way at all, so that a failed assertion cannot leave a
+/// server running.
+struct Running(std::process::Child);
+
+impl Drop for Running {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+#[test]
+fn the_ui_prints_its_secret_address_answers_only_to_those_who_have_it_and_closes_when_asked() {
+    use std::io::{BufRead, BufReader, Read};
+    use std::process::Stdio;
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+
+    let workspace = scratch("ui");
+    let child = Command::new(env!("CARGO_BIN_EXE_germen"))
+        .args(["ui", "--no-open", "--port", "0", "--workspace"])
+        .arg(&workspace)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("the germen binary must start");
+    let mut child = Running(child);
+
+    // What it prints: the address with the port and the token after the `#`.
+    let stdout = child.0.stdout.take().unwrap();
+    let (lines_tx, lines) = mpsc::channel();
+    std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+            if lines_tx.send(line).is_err() {
+                break;
+            }
+        }
+    });
+    let mut printed = Vec::new();
+    let url = loop {
+        let line = lines
+            .recv_timeout(Duration::from_secs(60))
+            .unwrap_or_else(|_| panic!("no address in time; printed so far: {printed:?}"));
+        printed.push(line.clone());
+        if let Some(at) = line.find("http://127.0.0.1:") {
+            break line[at..].trim().to_string();
+        }
+    };
+    let rest = url.strip_prefix("http://127.0.0.1:").unwrap();
+    let (port, token) = rest.split_once("/#k=").expect("the token is after the #");
+    let port: u16 = port.parse().expect("a port");
+    assert_ne!(
+        port, 0,
+        "port 0 asks for any free port; the address names the real one"
+    );
+    assert_eq!(token.len(), 64, "{url}");
+    assert!(token.bytes().all(|b| b.is_ascii_hexdigit()), "{url}");
+    let host = format!("127.0.0.1:{port}");
+
+    // The page: served to whoever asks, with a policy that names its one script and its one style.
+    let page = ask(port, "GET", "/", &host, None);
+    assert_eq!(page.status, 200);
+    let policy = page.header("content-security-policy").expect("a policy");
+    assert!(policy.contains("default-src 'none'"), "{policy}");
+    assert!(policy.contains("'sha256-"), "{policy}");
+    let html = text(&page.body);
+    assert!(html.contains("<meta name=\"germen-mode\" content=\"app\">"));
+    assert!(
+        !html.contains("function installDemo"),
+        "the demonstration is not in the program"
+    );
+    assert!(
+        !html.contains(token),
+        "the token is never written into the page"
+    );
+
+    // The interface: nothing without the token, nothing for another host, and the real answer.
+    assert_eq!(ask(port, "GET", "/api/ping", &host, None).status, 401);
+    let wrong = "0".repeat(64);
+    assert_eq!(
+        ask(port, "GET", "/api/ping", &host, Some(&wrong)).status,
+        401
+    );
+    assert_eq!(
+        ask(port, "GET", "/api/ping", "evil.example", Some(token)).status,
+        421,
+        "a name that someone made point to 127.0.0.1 is not this server"
+    );
+    let ping = ask(port, "GET", "/api/ping", &host, Some(token));
+    assert_eq!(ping.status, 200);
+    assert_eq!(text(&ping.body).replace(' ', ""), "{\"ok\":true}");
+    let system = ask(port, "GET", "/api/system", &host, Some(token));
+    assert_eq!(system.status, 200);
+    let system: serde_json::Value = serde_json::from_slice(&system.body).unwrap();
+    assert_eq!(system["version"], env!("CARGO_PKG_VERSION"));
+    assert_eq!(system["presets"].as_array().map(Vec::len), Some(5));
+    assert!(workspace.join("models").is_dir() && workspace.join("data").is_dir());
+
+    // The window's "Close": the process ends by itself, with success.
+    assert_eq!(
+        ask(port, "POST", "/api/quit", &host, Some(token)).status,
+        200
+    );
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let status = loop {
+        if let Some(status) = child.0.try_wait().unwrap() {
+            break status;
+        }
+        assert!(Instant::now() < deadline, "the Studio did not close");
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    let mut stderr = String::new();
+    let _ = child.0.stderr.take().unwrap().read_to_string(&mut stderr);
+    assert!(status.success(), "{status}; stderr: {stderr}");
+    printed.extend(lines.iter());
+    assert!(
+        printed.iter().any(|line| line.contains("s-a închis")),
+        "{printed:?}"
+    );
+    let _ = std::fs::remove_dir_all(&workspace);
+}
+
+#[test]
+fn the_ui_refuses_what_it_cannot_serve_before_it_starts_anything() {
+    let workspace = scratch("ui-refused");
+    let dir = workspace.to_string_lossy().into_owned();
+    for bad in ["0", "1000001", "99999999999999999999999"] {
+        let out = germen(&[
+            "ui",
+            "--no-open",
+            "--workspace",
+            &dir,
+            "--max-upload-mb",
+            bad,
+        ]);
+        assert!(!out.status.success(), "--max-upload-mb {bad}");
+        assert!(
+            !text(&out.stderr).contains("panicked"),
+            "{}",
+            text(&out.stderr)
+        );
+    }
+    let out = germen(&[
+        "ui",
+        "--no-open",
+        "--workspace",
+        &dir,
+        "--max-upload-mb",
+        "0",
+    ]);
+    assert_refused(&out, "--max-upload-mb");
+    assert!(!workspace.exists(), "a refused start creates nothing");
+
+    // The one-file demonstration page: written, not served.
+    let page = workspace.with_extension("html");
+    let out = germen(&["ui", "--write-demo", page.to_str().unwrap()]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    let html = std::fs::read_to_string(&page).unwrap();
+    assert!(html.contains("<meta name=\"germen-mode\" content=\"demo\">"));
+    assert!(html.contains("function installDemo"));
+    assert!(!workspace.exists());
+    let _ = std::fs::remove_file(&page);
+}

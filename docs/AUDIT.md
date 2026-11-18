@@ -1,12 +1,14 @@
 # Adversarial audit of GERMEN — findings, fixes and what remains
 
-Two rounds, both on 17 November 2026 and both done by the people who wrote the code (the author and
-an AI assistant), so "adversarial" means *tried hard to break it*, not an independent review:
-[PLAN.md](PLAN.md) schedules one by someone else before 1.0.
+Three rounds, the first two on 17 November 2026 and the third on 18 November 2026, all done by the
+people who wrote the code (the author and an AI assistant), so "adversarial" means *tried hard to
+break it*, not an independent review: [PLAN.md](PLAN.md) schedules one by someone else before 1.0.
 
 * **Part I — round 1** (sections 1–6): the 0.2.0 source, fixed in 0.3.0. Findings `A-01` … `A-24`.
 * **Part II — round 2** (sections 7–12): the 0.3.0 source (commit `c7bbf61`), fixed in 0.4.0.
   Findings `B-01` … `B-10`. Where it changes something Part I said, §4 says so in place.
+* **Part III — round 3** (sections 13–18): the Studio of 0.5.0 (`germen ui`), the only part of GERMEN
+  that listens on a socket. Findings `C-01` … `C-12`, and 18 mutation proofs of its gates.
 
 # Part I — round 1: 0.2.0 → 0.3.0
 
@@ -658,4 +660,165 @@ python3 scripts/audit_mutations.py
 cargo test --release -p germen-core --lib sha256_throughput -- --ignored --nocapture
 # a checkpoint can be checked without GERMEN; compare with the `files` map of meta.json:
 sha256sum DIR/weights.bpk DIR/optimizer.bpk DIR/tokenizer.json DIR/config.json
+```
+
+
+# Part III — round 3: the Studio of 0.5.0
+
+## 13. Scope and method
+
+**Audited:** the Studio as it stands in the 0.5.0 source before its first commit — `crates/germen-studio`
+(the server, the page with its CSS, JavaScript and eight languages), the command `germen ui`, and the
+three additions to the library that it needed (`Bpe::train_cancellable`, `generate::generate_until`,
+`data::sample_blocks`). Rounds 1 and 2 compared a new build with an old one; there is no earlier Studio,
+so the findings below are defects of the *draft* that a test, a linter or a browser found while it was
+being verified, each fixed before the release. The model of the attacker is in
+[STUDIO.md](STUDIO.md) §4.1: a program, or a web page of another origin in the user's own browser
+(including one that makes the browser resolve a hostile name to `127.0.0.1`: DNS rebinding), that can
+send bytes to the port; and the bytes themselves, from a typo to a hostile head.
+
+**Instruments.** Three, the first two in the repository:
+
+* **Tests that attack a real server over a socket** (21 in `crates/germen-studio/tests/http.rs`), 60 unit
+  tests of the crate and 2 tests of the command that start `germen ui` as a user would.
+* **Mutation proofs**, the entries `T-01` … `T-18` of
+  [`scripts/audit_mutations.py`](../scripts/audit_mutations.py): each gate of the server is switched off in
+  turn and a test must fail (§15).
+* **A real browser**: Chromium 153 driven by Playwright 1.63, axe-core 4.14.1 and ESLint 9 (their scripts and
+  configuration are not in the repository; the sweeps are described in [STUDIO.md](STUDIO.md) §8). Every
+  page and flow, in light and dark, in eight languages, at five widths; and the emulation of forced colours.
+
+**Severity** is that of §1. **Evidence codes:** **R** — reproduced: a test of the command failed on the
+draft. **T** — caught by a test of the page's own rules. **W** — found by driving the page in Chromium.
+**F** — found in Chromium's emulation of forced colours (Windows High Contrast). The machine is that of
+the other rounds: Linux, 2 virtual CPUs, 8 GB of memory.
+
+## 14. Findings
+
+| ID | Severity | What happens in the draft | Evidence | Now |
+|---|---|---|---|---|
+| C-01 | Low | `germen ui --max-upload-mb 1000001` starts the server although the message says the range is 1 … 1,000,000: only zero and an overflow of the product were refused | R | refused before anything starts, naming the option and the range; the test of the command tries 0, 1,000,001 and a number that overflows |
+| C-02 | Low | the demonstration page keeps its settings in the browser's `localStorage`, which the page's rule test forbids for both pages | T | memory only: lost when the tab is closed |
+| C-03 | Low | a copy button throws after its `await`: it reads `event.currentTarget` once the handler has returned | W | the element is taken before the `await` |
+| C-04 | Low | on a narrow range the labels of the y axis are identical ("6E-4" four times, "10.9K" three times) | W | labels get as many digits as it takes to tell them apart (up to five more) |
+| C-05 | Low | a logarithmic axis can have a single tick | W | at least three gridlines: powers of ten, then 2 and 5, then every digit, then round numbers |
+| C-06 | Low | the tooltip of a curve that has no point under the cursor does not say at which step it was read | W | a series with no point at the cursor shows its nearest one and says where that is |
+| C-07 | Low | long labels of buttons widen the whole page on a phone; the text of tabs is clipped in German and Portuguese | W | the sweep of every page × 8 languages × 5 widths (down to 320 px) finds no overflow and no clipped text |
+| C-08 | Low | the side bar with icons only has no names: nothing says what an icon is | W | every item has an accessible name, and a label beside it on hover and on keyboard focus |
+| C-09 | Low | the screen shown after Quit looks like a crash | W | it says that the Studio has closed, that the window can be closed, and how to come back |
+| C-10 | Low | in forced colours the progress bars lose their track (a background is dropped there): a fill of 1 % floats in nothing | F | every bar has an edge in the system's text colour |
+| C-11 | Low | in forced colours the sprout of the side bar, drawn in the page's pale ink, nearly vanishes on a white canvas | F | drawn in the system's colours |
+| C-12 | Low | in forced colours the dot of a chart legend vanishes, for the same reason as the track | F | the marks of a legend keep the series' colours, as the charts do |
+
+None is a flaw of the server's gates: those were attacked by the tests of §13 and by the proofs of
+§15 and no gate was found missing. Everything above is the page, or the command's own checks.
+
+**Also found, and fixed without a change of behaviour.** By clippy and ESLint: a function that nothing
+called (`until`), a type alias kept alive with `#[allow(dead_code)]`, a timer variable of the demonstration
+replay that was used before the line that assigns it, and two names that shadowed others.
+
+**A false alarm that is not counted.** In the emulation of forced colours with a light palette axe-core's
+contrast rule reports 9 elements of the side bar (1.12:1, "#eaf3fb on #ffffff"). axe reads the page's own
+text colour; the browser's computed colour for the same elements is the system's (dark blue on white),
+and a screenshot shows them legible. The report is a limit of the tool in that mode, and the three
+defects C-10 … C-12 were found by looking at screenshots, not by it.
+
+### Details
+
+**C-01 — a range that was documented and not enforced.** `--max-upload-mb` is the size of the largest
+text the page may upload; the help says "1 … 1,000,000" and the error for a bad value repeats it. The
+command, though, refused only 0 and a number whose product with 1,048,576 overflows. The finding came
+from the first test of the command, which gives the option 1,000,001 and waits for the command to end:
+the server started instead, printed its address and went on serving, and the test hung for more than nine
+minutes before the sandbox killed it. Fix: an explicit `(1..=MAX_UPLOAD_MB).contains(…)` in `cmd_ui`, with
+the constant defined once above it. The test now tries `0`, `1000001` and `99999999999999999999999`: each
+must fail without a panic; the refusal of `0` must also exit with code 1 and name `--max-upload-mb`; and a
+refused start must not create the workspace.
+
+**C-10 … C-12 — what "forced colours" removes.** In that mode the browser replaces the page's text,
+border and background colours by the system's; a *background* that carries meaning disappears, and
+(in Chromium) the colours that an SVG gets from `fill` and `stroke` are not replaced at all. The three defects are the two sides of that rule: a
+track and a legend dot drawn *only* with a background, and a drawing filled with colours chosen for
+a dark side bar that is white in this mode. Fixes, all in the `forced-colors` block of `style.css`:
+`.bar` and `.bar-track` get a 1 px `CanvasText` edge; `.sprout` is coloured `CanvasText` and `Highlight`;
+`.legend i` is exempted from the replacement, like `.chart .ser`. Checked again in both palettes
+(light and dark) on the run, Write and Settings pages, and on the tooltip of the icons-only side bar.
+
+## 15. Mutation proofs
+
+`python3 scripts/audit_mutations.py T-` (about three minutes; it edits the sources in place and restores
+them, then rebuilds). For each row the defect is put back, the named test runs, and it must fail. All 18 are
+**caught**.
+
+| ID | What is switched off | Test that must fail |
+|---|---|---|
+| T-01 | the `Host` header is no longer checked (DNS rebinding gets in) | `http::a_request_meant_for_another_host` |
+| T-02 | the `Origin` header is no longer checked | `http::requests_that_another_page_made` |
+| T-03 | `Sec-Fetch-Site` is no longer checked | `http::requests_that_another_page_made` |
+| T-04 | the token is no longer required | `http::the_api_needs_the_token` |
+| T-05 | any token is accepted | `http::the_api_needs_the_token` |
+| T-06 | the comparison of tokens accepts a prefix of the real one | `auth::` (unit tests) |
+| T-07 | the policy lets inline script run (its hash is replaced by `'unsafe-inline'`) | `the_page_is_served_with_a_policy` |
+| T-08 | the policy no longer asks for Trusted Types | `page::` (unit tests) |
+| T-09 | a model name may contain a slash (a way out of the workspace) | `names_from_the_network` |
+| T-10 | an upload may be larger than the limit | `http::a_text_can_be_uploaded_within_the_limit` |
+| T-11 | an upload may replace a file that is there | `http::a_text_can_be_uploaded_within_the_limit` |
+| T-12 | a second `Host` header is merged instead of refused (request smuggling) | `malformed_requests…` |
+| T-13 | the number of connections is not limited | `http::too_many_connections…` |
+| T-14 | a JSON body may be of any size | `malformed_requests…` |
+| T-15 | the server listens on every interface, not on `127.0.0.1` alone | `loopback_only` (unit test) |
+| T-16 | a model that is being trained can be checked (read half-written) from outside | `http::a_model_in_training_is_not_touched` |
+| T-17 | a fresh training over a trained model is accepted | `http::a_model_is_trained_from_scratch` |
+| T-18 | the page's Close does not close the server | `http::the_page_can_close_the_server` |
+
+**A proof that was bound to the wrong test.** At the first run T-14 was *not caught*. It was not a gap in
+the tests: the entry named `bodies_are_checked_before_anything_runs`, a test of bodies that are the wrong
+*kind* (not JSON, an array, deep nesting, a NUL byte, invalid UTF-8…), none of them about size, while the
+case that T-14 removes — a declared `Content-Length` of 5,000,000 bytes, refused with 413 — lives in
+`malformed_requests_are_refused_in_the_right_words_and_the_server_goes_on`. With the right filter it is caught. The lesson is the one of round 2: a mutation proof proves something only for the
+test it names, so each row names its test.
+
+## 16. Trade-offs and residual risks
+
+What the Studio does not defend against is said in [STUDIO.md](STUDIO.md) §4.4 and is not repeated here:
+a user who can run programs as you, a shoulder-surfer, a program that can sniff loopback with administrator
+rights, a hostile but self-consistent checkpoint (it meets the reader of Burn as on the command line), and
+the absence of a reviewer other than the authors. Beside those:
+
+* **The server's HTTP is our own.** It handles one request per connection and refuses what it does not
+  implement (no keep-alive, no chunked bodies, no upgrade), which keeps `http.rs` at about 570 lines and
+  adds no dependency to the workspace. The price is that nobody else has read a parser that sits on a
+  socket; the tests of §13, T-12 and T-14 and the limits of STUDIO.md §4.3 are what stands in for it.
+* **Trusted Types are enforced by Chromium only.** In another browser the other directives of the policy and
+  the absence of any way of writing markup from a string (a test of the page) still hold; the third line
+  of defence is missing there.
+* **The jobs live in memory.** Twelve jobs and 4,096 events each are kept; closing the Studio drops them. The
+  models are on disk and are never lost that way; the history of a run and its curves are.
+* **Loopback is not private on a shared computer** (STUDIO.md §4.4): the advice there is `--no-open` and
+  pasting the address by hand.
+
+## 17. What has not been verified
+
+* **Windows and macOS beyond CI.** The tests of the command run there; nobody has used the page on them with a
+  real browser (how the application window opens, the file picker's drives, how a notification is asked for).
+* **Browsers other than Chromium.** Only Chromium was run.
+* **Screen readers.** The structure passes axe and was read in the order a reader would; no person using
+  NVDA, JAWS, VoiceOver or Orca has used it. **Forced colours** were looked at only in Chromium's emulation
+  of its default light and dark palettes, not on a real Windows theme.
+* **Many cores and long runs.** Trainings of a few minutes on two cores; not days, and not a page left open for
+  days.
+* **An independent review** of `http.rs` and `auth.rs`, small enough to be read in an afternoon.
+
+## 18. Reproducing round 3
+
+```sh
+# the tests of the Studio and of the command (release build):
+cargo test --release --locked -p germen-studio
+cargo test --release --locked -p germen-cli --test cli
+# the 18 mutation proofs (about three minutes; edits the sources in place and restores them):
+python3 scripts/audit_mutations.py T-
+# the demonstration page, written by the program itself (it has no program behind it):
+germen ui --write-demo demo.html
+# the page in a browser: start it, open the address it prints, and follow the sweeps of STUDIO.md §8
+germen ui --workspace /tmp/gw
 ```

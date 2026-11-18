@@ -77,6 +77,23 @@ pub struct Corpus {
     pub bytes: usize,
 }
 
+/// Up to `budget` bytes of `data`, taken as evenly spaced 1 MiB blocks so that a very large
+/// corpus is represented by all of its parts, not only by its beginning.
+pub fn sample_blocks(data: &[u8], budget: usize) -> Vec<u8> {
+    const BLOCK: usize = 1 << 20;
+    if data.len() <= budget {
+        return data.to_vec();
+    }
+    let blocks = (budget / BLOCK).max(1);
+    let stride = data.len() / blocks;
+    let mut out = Vec::with_capacity(blocks * BLOCK);
+    for i in 0..blocks {
+        let start = i * stride;
+        out.extend_from_slice(&data[start..(start + BLOCK).min(data.len())]);
+    }
+    out
+}
+
 /// Where the validation tail starts in a text of `len` bytes (everything before it is training
 /// data). A tokenizer should be trained on `text[..split_point(..)]` only, so that the
 /// validation text stays unseen.
@@ -511,5 +528,29 @@ mod tests {
         assert!(a.len() >= 5000);
         assert!(a.chars().any(|c| "ăâîșț".contains(c)));
         assert!(a.contains('\n'));
+    }
+
+    #[test]
+    fn a_sample_is_the_whole_text_when_it_fits_and_evenly_spaced_blocks_when_not() {
+        let small = vec![7u8; 1000];
+        assert_eq!(sample_blocks(&small, 2000), small);
+        assert_eq!(sample_blocks(&small, 1000), small);
+
+        // Three MiB of text, each MiB a different byte: a 2 MiB budget takes two blocks, one from
+        // the beginning and one from the middle (stride = len / blocks), not only the beginning.
+        let mut big = Vec::new();
+        for fill in [1u8, 2, 3] {
+            big.extend(std::iter::repeat_n(fill, 1 << 20));
+        }
+        let sample = sample_blocks(&big, 2 << 20);
+        assert_eq!(sample.len(), 2 << 20);
+        assert_eq!(sample[0], 1);
+        assert_eq!(
+            sample[(1 << 20) + 1],
+            2,
+            "the second block starts in the second MiB"
+        );
+        // A budget below one block still takes one whole block.
+        assert_eq!(sample_blocks(&big, 10).len(), 1 << 20);
     }
 }

@@ -56,6 +56,27 @@ ripristinati, quindi l'addestramento prosegue senza il rialzo della perdita di u
 Lo stesso comando `train` rilanciato *senza* `--resume` viene rifiutato, perché non sostituisca per
 errore un modello addestrato; `--overwrite` lo consente quando si vuole davvero ricominciare.
 
+## La finestra: GERMEN Studio
+
+Preferite una finestra a una riga di comando?
+
+```bash
+germen ui
+```
+
+apre **GERMEN Studio**: scegliete un testo, premete **Avvia l’addestramento** e guardate un modello
+imparare — la curva della perdita, la velocità e campioni di ciò che la rete scrive man mano che
+migliora. La stessa finestra genera testo dai vostri modelli, ne controlla e ne ripara i file e
+misura la velocità del vostro computer, con lo stesso codice dei comandi qui sopra. Parla otto
+lingue, ha il tema chiaro e quello scuro, sta in una finestra grande quanto un telefono come su uno
+schermo largo ed è pensata per essere usata da tastiera e con uno screen reader.
+
+È un piccolo server che ascolta solo su `127.0.0.1`, più una pagina che serve: niente da installare,
+niente da scaricare, niente inviato da nessuna parte. L'indirizzo che stampa contiene un segreto
+valido solo per questa esecuzione, così solo la finestra aperta con esso (o voi) può dargli ordini.
+Modelli e testi stanno in `~/GERMEN` (`--workspace` lo cambia); `--no-open` stampa soltanto
+l'indirizzo. Come è protetto e il resto: [docs/STUDIO.md](docs/STUDIO.md).
+
 ## Comandi
 
 | comando | che cosa fa |
@@ -66,6 +87,7 @@ errore un modello addestrato; `--overwrite` lo consente quando si vuole davvero 
 | `germen train` | addestra da zero (`--data FILE` oppure `--demo`), o continua con `--resume` |
 | `germen generate` | genera testo da un modello addestrato, con una cache chiave/valore (`--temperature`, `--top-k`, `--prompt`) |
 | `germen verify` | controlla un checkpoint: dimensione e SHA-256 di ogni file rispetto a `meta.json` (quello che stampa `sha256sum`); `--recover` completa un salvataggio interrotto, senza bisogno di alcun testo |
+| `germen ui` | apre GERMEN Studio, l'interfaccia grafica: un server solo su `127.0.0.1` e una finestra propria (`--workspace`, `--port`, `--no-open`); vedere [docs/STUDIO.md](docs/STUDIO.md) |
 
 Opzioni di addestramento da conoscere: `--tokenizer byte|bpe` e `--vocab N` (la dimensione del BPE);
 `--batch` e `--accum` (accumulo del gradiente: il batch effettivo è il loro prodotto, la memoria è
@@ -127,6 +149,7 @@ di 15 sugli stessi due core.
 ```
 crates/germen-core   la libreria: config, model, tokenizer, bpe, data, train, gradients,
                      generate, checkpoint, bench
+crates/germen-studio GERMEN Studio: il server e la pagina dietro `germen ui` (solo libreria standard)
 crates/germen-cli    la riga di comando `germen` (clap)
 ```
 
@@ -161,19 +184,27 @@ crates/germen-cli    la riga di comando `germen` (clap)
   versione 0.1 si caricano ancora. Dalla 0.4 `meta.json` registra anche dimensione e SHA-256 degli
   altri file, controllati a ogni caricamento: un file danneggiato, troncato o di un altro
   salvataggio viene nominato nell'errore; quelli più vecchi si caricano senza controllo.
-* **Test** — 156 test (unitari della libreria e della riga di comando, più esecuzioni complete del
-  binario vero), tra cui: l'attenzione è causale, l'attenzione a blocchi è uguale a quella di Burn
-  (valori e gradienti), la generazione con cache è uguale al passaggio completo, i micro-batch
-  accumulati equivalgono a un batch grande, le repliche danno i gradienti di un solo grande grafo e
-  un'esecuzione è riproducibile bit per bit, un passo di ottimizzazione dopo il ricaricamento dello
-  stato di AdamW è uguale a quello di un addestramento ininterrotto, un checkpoint non resta mai
-  scritto a metà e i pesi non finiti non vengono mai salvati, i file ostili di tokenizer e
-  configurazione vengono rifiutati, ogni sequenza di byte sopravvive all'andata e ritorno col BPE.
-  Un bit cambiato in un file del checkpoint viene intercettato e il file nominato, e un salvataggio
-  interrotto in qualsiasi momento viene completato o scartato. L'audit avversariale è in
-  [docs/AUDIT.md](docs/AUDIT.md).
+* **Studio** — `germen ui` avvia un piccolo server HTTP scritto con la sola libreria standard,
+  legato a `127.0.0.1`, e serve una pagina autonoma (stile, script e otto lingue dentro; non
+  carica nulla). La pagina avvia lo stesso codice di addestramento, generazione e misura della riga
+  di comando e lo segue tramite eventi. Chi può parlare al server: un segreto nell'indirizzo (dopo
+  il `#`, che un browser non invia mai), le intestazioni `Host` e `Origin` e una
+  Content-Security-Policy che lascia eseguire esattamente uno script; ognuna di queste porte è
+  attaccata da test su un vero socket e disattivata a turno da 18 prove per mutazione, che i test
+  devono notare ([docs/STUDIO.md](docs/STUDIO.md)).
+* **Test** — 247 test (unitari della libreria, della riga di comando e dell'interfaccia grafica, più
+  esecuzioni complete del binario vero e del server tramite un socket), tra cui: l'attenzione è
+  causale, l'attenzione a blocchi è uguale a quella di Burn (valori e gradienti), la generazione con
+  cache è uguale al passaggio completo, i micro-batch accumulati equivalgono a un batch grande, le
+  repliche danno i gradienti di un solo grande grafo e un'esecuzione è riproducibile bit per bit, un
+  passo di ottimizzazione dopo il ricaricamento dello stato di AdamW è uguale a quello di un
+  addestramento ininterrotto, un checkpoint non resta mai scritto a metà e i pesi non finiti non
+  vengono mai salvati, i file ostili di tokenizer e configurazione vengono rifiutati, ogni sequenza
+  di byte sopravvive all'andata e ritorno col BPE. Un bit cambiato in un file del checkpoint viene
+  intercettato e il file nominato, e un salvataggio interrotto in qualsiasi momento viene completato
+  o scartato. L'audit avversariale è in [docs/AUDIT.md](docs/AUDIT.md).
 
-## Limiti (versione 0.4)
+## Limiti (versione 0.5)
 
 * Le somme di controllo proteggono dagli incidenti (un bit cambiato, un file troncato, file di due
   salvataggi diversi), non da chi può modificare anche `meta.json`; i checkpoint scritti prima della
@@ -187,9 +218,12 @@ crates/germen-cli    la riga di comando `germen` (clap)
 * Il corpus `demo` è sintetico e minuscolo: dimostra che la catena impara, nient'altro.
 * Non ancora misurato su Windows, macOS o su una macchina con molti core — sopra è spiegato come
   aiutare.
+* GERMEN Studio è stato provato in un vero browser solo su Linux e solo in Chromium; su Windows e
+  macOS i suoi test passano in CI, ma nessuno ne ha ancora usato la finestra lì, e nessuno l'ha
+  usato con uno screen reader.
 
-Vedere [CHANGELOG.md](CHANGELOG.md), [docs/PLAN.md](docs/PLAN.md) e [docs/AUDIT.md](docs/AUDIT.md).
-I contributi sono benvenuti ([CONTRIBUTING.md](CONTRIBUTING.md)).
+Vedere [CHANGELOG.md](CHANGELOG.md), [docs/PLAN.md](docs/PLAN.md), [docs/AUDIT.md](docs/AUDIT.md) e
+[docs/STUDIO.md](docs/STUDIO.md). I contributi sono benvenuti ([CONTRIBUTING.md](CONTRIBUTING.md)).
 
 ## Licenza
 

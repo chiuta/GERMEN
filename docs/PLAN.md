@@ -1,6 +1,6 @@
 # GERMEN — plan and decisions
 
-Status: version 0.4.0 (November 2026). The name is provisional; check it against trademark
+Status: version 0.5.0 (November 2026). The name is provisional; check it against trademark
 databases (EUIPO / TMview) before any public launch.
 
 ## 1. Goal
@@ -47,7 +47,9 @@ data, and to have a transparent, auditable base to build on.
 | threads | the whole command runs inside its own rayon pool (`sys::run_in_pool`) | +7 % (`mini`) to +25 % (`nano`) on two cores compared with driving the global pool from an outside thread, because every parallel loop otherwise needs a hand-off between threads |
 | data parallelism | the windows of a micro-batch are split among *replicas* of the model, each with its own autodiff graph (`Module::fork`), run forward and backward on different threads; gradients are added in a fixed pairwise order (`train::micro_batch_gradients`) | + 23 % (`nano`) to + 44 % (`micro`) on two cores (`mini` + 34 %, `small` + 36 %; ratios of the medians of five interleaved runs, ± 10 %), with a peak memory 1–3 % lower: the small element-wise operations that do not scale inside one graph now run side by side. A fixed slot scheme, a fixed reduction tree and a fixed order of drawing the initial weights make a run reproducible for a given number of threads and replicas; a test compares the gradients with those of one big graph |
 | checkpoint | burnpack + JSON; every file staged, fsynced and renamed together, `meta.json` last; a lock file per directory; non-finite weights are never written or loaded | a crash or a second run can no longer leave a mixed set of files, and a diverged model cannot replace a good checkpoint (see [AUDIT.md](AUDIT.md)) |
-| UI language | Romanian messages, English code and docs, READMEs in eight languages | first user is Romanian; moving the messages to a catalogue is a starter issue |
+| UI language | Romanian messages on the command line, English code and docs, READMEs in eight languages; the Studio is in eight languages | first user is Romanian; moving the command-line messages to a catalogue is a starter issue |
+| graphical interface | **GERMEN Studio** (`germen ui`): a small HTTP server on the standard library, bound to `127.0.0.1`, and one self-contained page that a browser shows as an application window; not egui | no new dependency and no second toolchain (egui would add a second large dependency tree of window, graphics and font layers to a project whose point is a small base that can be read, and a working graphics stack on every machine); the browser brings the accessibility tree, screen readers, zoom, forced colours and eight scripts of text for free; one page works the same on Windows, macOS and Linux. The cost is a server that a web page can try to talk to, so it is the most scrutinised part of the code: token, `Host`/`Origin`/`Sec-Fetch-Site`, a policy of one hashed script, names resolved in one module, limits before reads, and 18 mutation proofs (see [STUDIO.md](STUDIO.md) §4) |
+| the Studio's server | HTTP/1.1 subset written by hand: one request per connection, no keep-alive, no chunked bodies, no `Upgrade`, a long poll instead of WebSockets or server-sent events | a framework is a large body of code that the project would have to trust without having read it; the subset is about 570 lines with its comments (`http.rs`), and every limit is checked before the data it guards is read. A long poll over plain requests needs no upgrade and is cut cleanly when the page goes away |
 
 ## 4. Performance findings (2-core AVX-512 VM, `mini`, batch 16 × 256)
 
@@ -124,9 +126,12 @@ feed-forward and attention blocks.
 * **0.4 (done)** — second adversarial audit ([AUDIT.md](AUDIT.md), Part II): checkpoint manifest
   with SHA-256, `germen verify`, a journal for saves, strict `--resume`, no silent overwrite,
   bounded pre-token scan, hardware SHA-256.
-* **0.5** — memory-mapped corpora larger than RAM; desktop GUI (egui) with live loss curve and
-  samples; safetensors export/import; whatever the first many-core measurement calls for.
-* **0.6** — opt-in GPU backend (`wgpu`) behind a Cargo feature; community benchmark table.
+* **0.5 (done)** — GERMEN Studio, the graphical interface (`germen ui`): live curves and samples,
+  models, writing, speed, eight languages; a review of its server ([STUDIO.md](STUDIO.md),
+  [AUDIT.md](AUDIT.md) Part III) and a demonstration page.
+* **0.6** — memory-mapped corpora larger than RAM; safetensors export/import; whatever the first
+  many-core measurement calls for; the Studio on Windows and macOS with real users (§7).
+* **0.7** — opt-in GPU backend (`wgpu`) behind a Cargo feature; community benchmark table.
 * **1.0** — the command-line messages in the project's usual languages; releases for Windows,
   Linux and macOS built by CI; a second adversarial audit (by someone other than the author of the
   code) before the announcement.
@@ -140,7 +145,7 @@ feed-forward and attention blocks.
    engine file over shared headers, with no step-by-step guide. A GERMEN model (dense,
    squared-ReLU feed-forward, byte or BPE vocabulary) is not among the listed architectures, so it
    cannot be loaded there unchanged. Nothing has been tried; a GGUF or safetensors export would be
-   the first step and is not planned before 0.5. Source: the README of
+   the first step and is not planned before 0.6. Source: the README of
    <https://github.com/JustVugg/colibri>, read on 2026-11-17.
 3. **Training data** — any pre-trained model that is shipped needs a corpus whose licence allows
    it (public-domain literature, openly licensed Wikipedia text, own writing). Not decided.
@@ -150,8 +155,8 @@ feed-forward and attention blocks.
 
 ## 7. What has been verified so far
 
-* 156 tests pass (release build, Linux): unit tests of the library and of the command line, and
-  end-to-end runs of the real binary. The core suite ran 40 times in a row in parallel mode
+* 247 tests pass (release build, Linux): unit tests of the library, of the command line and of the
+  Studio, and end-to-end runs of the real binary and of the server over a socket. The core suite ran 40 times in a row in parallel mode
   without a failure; before the fix of A-24 it failed in 2 of 13 runs.
 * The adversarial audit of 0.2 ([AUDIT.md](AUDIT.md), Part I): 15 findings reproduced against a
   0.2.0 binary and gone in 0.3.0, two suspicions that did not reproduce, seven found by reading the
@@ -170,6 +175,10 @@ feed-forward and attention blocks.
   warnings`, the 117 tests and an end-to-end smoke run on Ubuntu 26.04, Windows and macOS, and a
   build with Rust 1.95. The weekly dependency audit is green since `9fa10b2` (red on the first
   commit; see A-20 in [AUDIT.md](AUDIT.md)).
+* GERMEN Studio (0.5): 21 integration tests that attack a real server over a socket, 2 that start
+  `germen ui` as a user would, and 18 mutation proofs of its gates, all caught; the page was
+  driven in Chromium (every page and flow, eight languages, five widths, axe-core, forced colours
+  by emulation, the demonstration page end to end). What that does not cover is in [STUDIO.md](STUDIO.md) §9.
 * **Not verified:** Windows and macOS beyond the CI smoke run (no real-size training or speed
   figures there, and the rename retry has never met a real antivirus scanner); anything on more
   than two cores; anything beyond the 85 M `base` preset; any real-world corpus; loading a GERMEN

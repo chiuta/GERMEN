@@ -56,6 +56,27 @@ din nou la întâmplare).
 Aceeași comandă `train` rulată din nou, *fără* `--resume`, este refuzată, ca să nu înlocuiți din
 greșeală un model antrenat; `--overwrite` o permite când vreți să o luați de la capăt.
 
+## Fereastra: GERMEN Studio
+
+Preferați o fereastră în locul liniei de comandă?
+
+```bash
+germen ui
+```
+
+deschide **GERMEN Studio**: alegeți un text, apăsați **Pornește antrenarea** și priviți un model
+cum învață — curba pierderii, viteza și mostre din ce scrie rețeaua pe măsură ce se îmbunătățește.
+Aceeași fereastră generează text din modelele voastre, le verifică și le repară fișierele și
+măsoară viteza calculatorului, cu același cod ca al comenzilor de mai sus. Vorbește opt limbi, are
+temă luminoasă și întunecată, încape atât într-o fereastră cât un telefon, cât și pe un ecran lat,
+și e construită ca să poată fi folosită de la tastatură și cu un cititor de ecran.
+
+E un singur server mic, care ascultă doar pe `127.0.0.1`, plus o pagină pe care o servește: nimic de
+instalat, nimic descărcat, nimic trimis nicăieri. Adresa afișată conține un secret valabil doar
+pentru această rulare, deci numai fereastra deschisă cu ea (sau voi) îi poate da comenzi. Modelele
+și textele se păstrează în `~/GERMEN` (`--workspace` schimbă asta); `--no-open` doar afișează
+adresa. Cum e protejat și restul: [docs/STUDIO.md](docs/STUDIO.md).
+
 ## Comenzi
 
 | comandă | ce face |
@@ -66,6 +87,7 @@ greșeală un model antrenat; `--overwrite` o permite când vreți să o luați 
 | `germen train` | antrenează de la zero (`--data FIȘIER` sau `--demo`) sau continuă cu `--resume` |
 | `germen generate` | generează text dintr-un model antrenat, cu cache cheie/valoare (`--temperature`, `--top-k`, `--prompt`) |
 | `germen verify` | verifică un punct de control: mărimea și suma SHA-256 a fiecărui fișier față de `meta.json` (ce afișează `sha256sum`); `--recover` termină o salvare întreruptă, fără să aibă nevoie de text |
+| `germen ui` | deschide GERMEN Studio, interfața grafică: un server doar pe `127.0.0.1` și o fereastră proprie (`--workspace`, `--port`, `--no-open`); vedeți [docs/STUDIO.md](docs/STUDIO.md) |
 
 Opțiuni de antrenare bune de știut: `--tokenizer byte|bpe` și `--vocab N` (mărimea BPE); `--batch`
 și `--accum` (acumulare de gradienți: lotul efectiv e produsul lor, memoria e doar cea a lui
@@ -126,6 +148,7 @@ loc de 15, pe aceleași două nuclee.
 ```
 crates/germen-core   biblioteca: config, model, tokenizer, bpe, date, antrenare, gradienți,
                      generare, salvare, benchmark
+crates/germen-studio GERMEN Studio: serverul și pagina din spatele lui `germen ui` (doar biblioteca standard)
 crates/germen-cli    linia de comandă `germen` (clap)
 ```
 
@@ -160,19 +183,27 @@ crates/germen-cli    linia de comandă `germen` (clap)
   control scrise de versiunea 0.1 se încarcă în continuare. De la 0.4, `meta.json` ține și mărimea
   și suma SHA-256 ale celorlalte fișiere, verificate la fiecare încărcare: un fișier deteriorat,
   trunchiat sau dintr-o altă salvare e numit în mesaj; cele mai vechi se încarcă fără verificare.
-* **Teste** — 156 de teste (unitare ale bibliotecii și ale liniei de comandă, plus rulări complete
-  ale executabilului real), între care: atenția e cauzală, atenția pe blocuri e egală cu cea a lui
-  Burn (valori și gradienți), generarea cu cache dă aceleași rezultate ca trecerea completă,
-  micro-loturile acumulate echivalează cu un lot mare, replicile dau gradienții unui singur graf
-  mare iar o rulare e reproductibilă bit cu bit, un pas de optimizare după reîncărcarea stării AdamW
-  e egal cu cel al unei rulări neîntrerupte, un punct de control nu rămâne niciodată scris pe
-  jumătate iar ponderile non-finite nu se salvează, fișierele ostile de tokenizator și de
-  configurare sunt respinse, orice șir de octeți supraviețuiește turului complet prin BPE. Un bit
-  schimbat într-un fișier al punctului de control e prins și fișierul e numit, iar o salvare
-  întreruptă oricând e terminată sau aruncată. Auditul adversarial e în
-  [docs/AUDIT.md](docs/AUDIT.md).
+* **Studio** — `germen ui` pornește un mic server HTTP scris doar cu biblioteca standard, legat de
+  `127.0.0.1`, și servește o singură pagină de sine stătătoare (stilul, scriptul și cele opt limbi
+  sunt înăuntru; nu încarcă nimic). Pagina pornește același cod de antrenare, generare și măsurare
+  ca linia de comandă și îl urmărește prin evenimente. Cine poate vorbi cu serverul: un secret din
+  adresă (după `#`, pe care un browser nu-l trimite niciodată), antetele `Host` și `Origin` și o
+  Content-Security-Policy care lasă să ruleze exact un script; fiecare dintre aceste porți e atacată
+  de teste printr-un socket real și oprită pe rând de 18 dovezi prin mutație, pe care testele
+  trebuie să le observe ([docs/STUDIO.md](docs/STUDIO.md)).
+* **Teste** — 247 de teste (unitare ale bibliotecii, ale liniei de comandă și ale interfeței
+  grafice, plus rulări complete ale executabilului real și ale serverului printr-un socket), între
+  care: atenția e cauzală, atenția pe blocuri e egală cu cea a lui Burn (valori și gradienți),
+  generarea cu cache dă aceleași rezultate ca trecerea completă, micro-loturile acumulate
+  echivalează cu un lot mare, replicile dau gradienții unui singur graf mare iar o rulare e
+  reproductibilă bit cu bit, un pas de optimizare după reîncărcarea stării AdamW e egal cu cel al
+  unei rulări neîntrerupte, un punct de control nu rămâne niciodată scris pe jumătate iar ponderile
+  non-finite nu se salvează, fișierele ostile de tokenizator și de configurare sunt respinse, orice
+  șir de octeți supraviețuiește turului complet prin BPE. Un bit schimbat într-un fișier al
+  punctului de control e prins și fișierul e numit, iar o salvare întreruptă oricând e terminată sau
+  aruncată. Auditul adversarial e în [docs/AUDIT.md](docs/AUDIT.md).
 
-## Limite (versiunea 0.4)
+## Limite (versiunea 0.5)
 
 * Sumele de control apără de accidente (un bit schimbat, un fișier trunchiat, fișiere din două
   salvări diferite), nu de cineva care poate edita și `meta.json`; punctele de control scrise
@@ -186,9 +217,13 @@ crates/germen-cli    linia de comandă `germen` (clap)
 * Corpusul `demo` e sintetic și mic: arată că fluxul învață, atât.
 * Încă nemăsurat pe Windows, macOS sau pe un calculator cu multe nuclee — mai sus e cum puteți
   ajuta.
+* GERMEN Studio a fost rulat într-un browser real doar pe Linux și doar în Chromium; pe Windows și
+  macOS testele lui trec în CI, dar nimeni nu i-a folosit încă fereastra acolo și nimeni nu l-a
+  folosit cu un cititor de ecran.
 
-Vedeți [CHANGELOG.md](CHANGELOG.md), [docs/PLAN.md](docs/PLAN.md) și [docs/AUDIT.md](docs/AUDIT.md).
-Contribuțiile sunt binevenite ([CONTRIBUTING.md](CONTRIBUTING.md)).
+Vedeți [CHANGELOG.md](CHANGELOG.md), [docs/PLAN.md](docs/PLAN.md), [docs/AUDIT.md](docs/AUDIT.md) și
+[docs/STUDIO.md](docs/STUDIO.md). Contribuțiile sunt binevenite
+([CONTRIBUTING.md](CONTRIBUTING.md)).
 
 ## Licență
 

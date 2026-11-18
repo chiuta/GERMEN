@@ -52,6 +52,27 @@ training goes on without the loss bump of a cold restart (the random text window
 Running the same `train` command again *without* `--resume` is refused, so that it cannot replace a
 trained model by mistake; add `--overwrite` to start over on purpose.
 
+## The window: GERMEN Studio
+
+Prefer a window to a command line?
+
+```bash
+germen ui
+```
+
+opens **GERMEN Studio**: choose a text, press **Start training** and watch a model learn — the loss
+curve, the speed, and samples of what the network writes as it improves. The same window writes
+text from your models, checks and repairs their files and measures the speed of your computer, with
+the same code as the commands above. It comes in eight languages, light and dark, fits a
+phone-sized window as well as a wide screen, and is built to be used from the keyboard and with a
+screen reader.
+
+It is one small server that listens on `127.0.0.1` only, and one page that it serves: nothing to
+install, nothing downloaded, nothing sent anywhere. The address it prints holds a secret that is
+good for this run only, so only the window opened with it (or you) can give it orders. Models and
+texts are kept in `~/GERMEN` (`--workspace` changes that); `--no-open` only prints the address. How
+it is secured, and the rest: [docs/STUDIO.md](docs/STUDIO.md).
+
 ## Commands
 
 | command | what it does |
@@ -62,6 +83,7 @@ trained model by mistake; add `--overwrite` to start over on purpose.
 | `germen train` | trains from scratch (`--data FILE` or `--demo`), or continues with `--resume` |
 | `germen generate` | samples text from a trained model, with a key/value cache (`--temperature`, `--top-k`, `--prompt`) |
 | `germen verify` | checks a checkpoint: the size and SHA-256 of every file against `meta.json` (what `sha256sum` prints); `--recover` finishes a save that was cut off, without needing any text |
+| `germen ui` | opens GERMEN Studio, the graphical interface: a server on `127.0.0.1` only and a window of its own (`--workspace`, `--port`, `--no-open`); see [docs/STUDIO.md](docs/STUDIO.md) |
 
 Training options worth knowing: `--tokenizer byte|bpe` and `--vocab N` (the BPE size); `--batch` and
 `--accum` (gradient accumulation: the effective batch is their product, the memory is that of
@@ -120,6 +142,7 @@ same two cores.
 ```
 crates/germen-core   the library: config, model, tokenizer, bpe, data, train, gradients,
                      generate, checkpoint, bench
+crates/germen-studio GERMEN Studio: the server and the page behind `germen ui` (standard library only)
 crates/germen-cli    the `germen` command line (clap)
 ```
 
@@ -151,17 +174,26 @@ crates/germen-cli    the `germen` command line (clap)
   0.1 still load. Since 0.4 `meta.json` also records the size and SHA-256 of the other files,
   checked on every load: a damaged, truncated or mixed-up file is named in the error; older
   checkpoints load unchecked.
-* **Tests** — 156 tests (unit tests of the library and of the command line, and end-to-end runs of
-  the real binary), among them: attention is causal, block attention equals Burn's attention (values
-  and gradients), cached generation equals the full forward pass, accumulated micro-batches equal
-  one large batch, replicas give the gradients of one big graph and a run is reproducible bit for
-  bit, an optimizer step after reloading the AdamW state equals the step of an uninterrupted run, a
-  checkpoint is never left half-written and non-finite weights are never saved, hostile tokenizer
-  and configuration files are refused, every byte sequence survives the BPE round trip. A flipped
-  bit in a checkpoint file is caught and the file named, and a save cut off at any moment is
-  completed or discarded. The adversarial audit is in [docs/AUDIT.md](docs/AUDIT.md).
+* **Studio** — `germen ui` starts a small HTTP server written on the standard library alone, bound
+  to `127.0.0.1`, and serves one self-contained page (style, script and eight languages inside; it
+  loads nothing). The page starts the same training, generation and measuring code as the command
+  line and follows it through events. Who may talk to the server: a secret in the address (after
+  the `#`, which a browser never sends), the `Host` and `Origin` headers, and a
+  Content-Security-Policy that lets exactly one script run; each of these gates is attacked by
+  tests over a real socket and switched off in turn by 18 mutation proofs, which the tests must
+  notice ([docs/STUDIO.md](docs/STUDIO.md)).
+* **Tests** — 247 tests (unit tests of the library, of the command line and of the Studio, and
+  end-to-end runs of the real binary and of the server over a socket), among them: attention is
+  causal, block attention equals Burn's attention (values and gradients), cached generation equals
+  the full forward pass, accumulated micro-batches equal one large batch, replicas give the
+  gradients of one big graph and a run is reproducible bit for bit, an optimizer step after
+  reloading the AdamW state equals the step of an uninterrupted run, a checkpoint is never left
+  half-written and non-finite weights are never saved, hostile tokenizer and configuration files are
+  refused, every byte sequence survives the BPE round trip. A flipped bit in a checkpoint file is
+  caught and the file named, and a save cut off at any moment is completed or discarded. The
+  adversarial audit is in [docs/AUDIT.md](docs/AUDIT.md).
 
-## Limitations (version 0.4)
+## Limitations (version 0.5)
 
 * The checksums guard against accidents (a flipped bit, a truncated file, files of two different
   saves), not against someone who can edit `meta.json` as well; checkpoints written before 0.4
@@ -174,9 +206,13 @@ crates/germen-cli    the `germen` command line (clap)
 * No mixed precision and no GPU backend.
 * The `demo` corpus is synthetic and tiny: it proves the pipeline learns, nothing more.
 * Not yet measured on Windows, macOS or a machine with many cores — see above for how to help.
+* GERMEN Studio has been run in a real browser on Linux only, and in Chromium only; on Windows and
+  macOS its tests pass in CI, but nobody has used its window there yet, and nobody has used it with
+  a screen reader.
 
-See [CHANGELOG.md](CHANGELOG.md), [docs/PLAN.md](docs/PLAN.md) and [docs/AUDIT.md](docs/AUDIT.md).
-Contributions are welcome — the open issues are a good start ([CONTRIBUTING.md](CONTRIBUTING.md)).
+See [CHANGELOG.md](CHANGELOG.md), [docs/PLAN.md](docs/PLAN.md), [docs/AUDIT.md](docs/AUDIT.md) and
+[docs/STUDIO.md](docs/STUDIO.md). Contributions are welcome — the open issues are a good start
+([CONTRIBUTING.md](CONTRIBUTING.md)).
 
 ## License
 
