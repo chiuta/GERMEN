@@ -372,7 +372,10 @@ fn the_api_needs_the_token_and_nothing_less_will_do() {
     assert_eq!(ok.status, 200);
     assert_eq!(ok.json(), json!({ "ok": true }));
 
-    let wrong = format!("{}0", &h.token[..h.token.len() - 1]);
+    // A different last character, whatever the random token ends with (a fixed "0" would equal the
+    // token one time in sixteen and make this test fail by chance).
+    let last = if h.token.ends_with('0') { '1' } else { '0' };
+    let wrong = format!("{}{last}", &h.token[..h.token.len() - 1]);
     let upper = h.token.to_uppercase();
     let attempts: Vec<(String, String)> = vec![
         ("no header at all".into(), String::new()),
