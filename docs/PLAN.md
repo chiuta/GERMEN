@@ -179,6 +179,10 @@ feed-forward and attention blocks.
   `germen ui` as a user would, and 18 mutation proofs of its gates, all caught; the page was
   driven in Chromium (every page and flow, eight languages, five widths, axe-core, forced colours
   by emulation, the demonstration page end to end). What that does not cover is in [STUDIO.md](STUDIO.md) §9.
+* CI on the pushed commits `26d0581` and `303cfb3` (every job green): `rustfmt`, `clippy -D warnings`
+  with the newest stable Rust, the 247 tests on Ubuntu 26.04, Windows and macOS (the two tests of the
+  command start `germen ui` on each) and a build with Rust 1.95; and the dependency audit on `26d0581`
+  (the one that changed `Cargo.lock`).
 * **Not verified:** Windows and macOS beyond the CI smoke run (no real-size training or speed
   figures there, and the rename retry has never met a real antivirus scanner); anything on more
   than two cores; anything beyond the 85 M `base` preset; any real-world corpus; loading a GERMEN

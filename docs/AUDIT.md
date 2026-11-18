@@ -799,8 +799,10 @@ the absence of a reviewer other than the authors. Beside those:
 
 ## 17. What has not been verified
 
-* **Windows and macOS beyond CI.** The tests of the command run there; nobody has used the page on them with a
-  real browser (how the application window opens, the file picker's drives, how a notification is asked for).
+* **Windows and macOS beyond CI.** The tests of the command run there (every job of the CI workflow is green
+  on `26d0581` and `303cfb3`, the clippy job with the newest stable Rust); nobody has used the page on them
+  with a real browser (how the application window opens, the file picker's drives, how a notification is
+  asked for).
 * **Browsers other than Chromium.** Only Chromium was run.
 * **Screen readers.** The structure passes axe and was read in the order a reader would; no person using
   NVDA, JAWS, VoiceOver or Orca has used it. **Forced colours** were looked at only in Chromium's emulation
