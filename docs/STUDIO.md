@@ -246,8 +246,9 @@ Training and measuring speed share one slot; writing has its own.
 * The accessible name of a control contains its visible text (so that voice control can say it).
   Live regions announce the end of a training, the result of a check and the point under a chart's
   cursor.
-* It works from 320 px wide (a phone) to a wide screen; the side bar becomes a row of tabs. Text size
-  from 85 % to 160 % in Settings, or with the browser's zoom.
+* It works from 320 px wide (a phone) to a wide screen; the side bar becomes a row of tabs, and the
+  page keeps clear of a phone's notch and system bars (`env(safe-area-inset-*)`; zero on a computer).
+  Text size from 85 % to 160 % in Settings, or with the browser's zoom.
 
 ## 7. The demonstration page
 

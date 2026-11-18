@@ -217,7 +217,7 @@ kbd {
 .shell[data-rail="compact"] .rail-item:hover::after, .shell[data-rail="compact"] .rail-item:focus-visible::after,
 .shell[data-rail="compact"] .rail-job:hover::after, .shell[data-rail="compact"] .rail-job:focus-visible::after { opacity: 1; }
 
-.main { min-width: 0; outline: none; }
+.main { min-width: 0; outline: none; padding: env(safe-area-inset-top, 0px) env(safe-area-inset-right, 0px) 0 env(safe-area-inset-left, 0px); }
 .page { max-width: 86rem; margin-inline: auto; padding: var(--pad); display: grid; grid-template-columns: minmax(0, 1fr); gap: 1.5rem; }
 .page-head { display: grid; gap: 0.4rem; max-width: 52rem; }
 .lede { color: var(--ink-2); font-size: 1.0625rem; max-width: 60ch; }
